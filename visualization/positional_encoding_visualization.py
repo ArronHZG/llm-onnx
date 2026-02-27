@@ -1,6 +1,6 @@
-import torch
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
+import torch
 
 
 class PositionalEncoding(torch.nn.Module):
@@ -72,8 +72,10 @@ def visualize_positional_encoding(d_model: int = 512, seq_len: int = 100):
 
     # 调整布局，避免重叠
     plt.tight_layout()
-    # 保存图片（可选）
-    plt.savefig('positional_encoding_visualization.png', dpi=300, bbox_inches='tight')
+    # 保存图片到image目录
+    import os
+    os.makedirs('image', exist_ok=True)
+    plt.savefig('image/positional_encoding_visualization.png', dpi=300, bbox_inches='tight')
     # 显示图片
     plt.show()
 

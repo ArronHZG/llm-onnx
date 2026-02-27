@@ -1,4 +1,8 @@
+"""
+GPT Transformer with Rotary Position Embedding (RoPE) 实现
+"""
 import math
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -56,6 +60,8 @@ def apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin):
 
 
 class MultiHeadAttentionWithRoPE(nn.Module):
+    """带RoPE的多头注意力"""
+
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, rope_base: float = 10000.0):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -89,7 +95,7 @@ class MultiHeadAttentionWithRoPE(nn.Module):
                 rope_base=self.rope_base
             )
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None):
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         前向传播
         Args:
@@ -134,14 +140,16 @@ class MultiHeadAttentionWithRoPE(nn.Module):
 
 
 class FeedForward(nn.Module):
+    """GPT前馈网络（使用ReLU激活，实际GPT使用GELU）"""
+
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
         self.linear1 = nn.Linear(d_model, d_ff)
         self.linear2 = nn.Linear(d_ff, d_model)
         self.dropout = nn.Dropout(dropout)
-        self.activate = nn.ReLU()  # GPT使用GELU激活
+        self.activate = nn.ReLU()  # 注意：GPT使用GELU激活
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         前向传播
         Args:
@@ -156,7 +164,9 @@ class FeedForward(nn.Module):
         return x
 
 
-class GPTTransformerBlock(nn.Module):
+class GPTTransformerBlockWithRoPE(nn.Module):
+    """带RoPE的GPT Transformer块"""
+
     def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1, rope_base: float = 10000.0):
         super().__init__()
         # Pre-LN结构（GPT的特点）
@@ -166,7 +176,7 @@ class GPTTransformerBlock(nn.Module):
         self.ff = FeedForward(d_model, d_ff, dropout)
         self.dropout = nn.Dropout(dropout)
 
-    def _create_causal_mask(self, seq_len: int, device: torch.device):
+    def _create_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """
         创建因果掩码（兼容ONNX）
         Args:
@@ -182,7 +192,7 @@ class GPTTransformerBlock(nn.Module):
         mask = mask.unsqueeze(0).unsqueeze(0)  # 扩展维度
         return mask
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         前向传播
         Args:
@@ -212,9 +222,19 @@ class GPTTransformerBlock(nn.Module):
 
 
 class GPTTransformerWithRoPE(nn.Module):
-    def __init__(self, vocab_size: int, d_model: int = 768, n_heads: int = 12,
-                 n_layers: int = 12, d_ff: int = 3072, dropout: float = 0.1,
-                 rope_base: float = 10000.0, max_seq_len: int = 1024):
+    """完整的带RoPE的GPT Transformer模型"""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 768,
+        n_heads: int = 12,
+        n_layers: int = 12,
+        d_ff: int = 3072,
+        dropout: float = 0.1,
+        rope_base: float = 10000.0,
+        max_seq_len: int = 1024,
+    ):
         super().__init__()
         # 词嵌入
         self.embedding = nn.Embedding(vocab_size, d_model)
@@ -222,7 +242,7 @@ class GPTTransformerWithRoPE(nn.Module):
         self.drop_emb = nn.Dropout(dropout)
         # Transformer层堆叠
         self.layers = nn.ModuleList([
-            GPTTransformerBlock(d_model, n_heads, d_ff, dropout, rope_base)
+            GPTTransformerBlockWithRoPE(d_model, n_heads, d_ff, dropout, rope_base)
             for _ in range(n_layers)
         ])
         # 最终层归一化
@@ -231,11 +251,12 @@ class GPTTransformerWithRoPE(nn.Module):
         self.head = nn.Linear(d_model, vocab_size, bias=False)
 
         # 保存配置参数
+        self.vocab_size = vocab_size
         self.d_model = d_model
         self.max_seq_len = max_seq_len
         self.rope_base = rope_base
 
-    def forward(self, input_ids: torch.Tensor):
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
         完整GPT Transformer前向传播
         Args:
@@ -243,7 +264,6 @@ class GPTTransformerWithRoPE(nn.Module):
         Returns:
             logits: [batch_size, seq_len, vocab_size]
         """
-
         # 嵌入层
         x = self.embedding(input_ids)
         x = self.drop_emb(x)
@@ -259,118 +279,33 @@ class GPTTransformerWithRoPE(nn.Module):
         return logits
 
 
-# ONNX导出函数
-def export_to_onnx(model: nn.Module, dummy_input: torch.Tensor, onnx_path: str):
-    """
-    将模型导出为ONNX格式
-    Args:
-        model: 训练好的模型
-        dummy_input: 用于推断形状的虚拟输入 [batch_size, seq_len]
-        onnx_path: ONNX文件保存路径
-    """
-    # 设置模型为评估模式（禁用dropout等随机操作）
-    model.eval()
-
-    # 导出配置（兼容ONNX）
-    torch.onnx.export(
-        model,
-        dummy_input,
-        onnx_path,
-        export_params=True,
-        opset_version=17,
-        do_constant_folding=False,
-        input_names=['input_ids'],
-        output_names=['logits'],
-        # dynamic_axes={
-        #     'input_ids': {0: 'batch_size', 1: 'seq_len'},  # 动态批次和序列长度
-        #     'logits': {0: 'batch_size', 1: 'seq_len'}
-        # }
-    )
-    print(f"模型已成功导出到: {onnx_path}")
-
-
-def simplify_onnx(onnx_path: str, output_path: str = None):
-    """
-    使用 onnxsim 简化 ONNX 模型
-    Args:
-        onnx_path: 输入 ONNX 文件路径
-        output_path: 输出 ONNX 文件路径（默认覆盖原文件）
-    """
-    try:
-        import onnx
-        import onnxsim
-    except ImportError:
-        print("警告: onnxsim 未安装，跳过简化步骤")
-        return
-
-    if output_path is None:
-        output_path = onnx_path
-
-    print(f"正在简化 ONNX 模型...")
-
-    # 加载并简化模型
-    model = onnx.load(onnx_path)
-    check = False
-    try:
-        model_simp, check = onnxsim.simplify(model)
-    except Exception as e:
-        print(f"ONNX 模型简化失败: {e}")
-
-    if check:
-        onnx.save(model_simp, output_path)
-        print(f"ONNX 模型简化成功: {output_path}")
-    else:
-        print("ONNX 模型简化失败")
-
-    return
-
-
-# 测试代码
 if __name__ == "__main__":
-    # 配置参数
-    vocab_size = 50257  # GPT-2的词汇表大小
+    # 测试代码
+    vocab_size = 50257  # GPT-2词汇表大小
     batch_size = 2
     seq_len = 10
 
-    # 1. 创建模型实例
     model = GPTTransformerWithRoPE(
         vocab_size=vocab_size,
         d_model=768,
         n_heads=12,
-        n_layers=1,  # 简化版，实际GPT-2是12层
+        n_layers=1,  # 简化版
         d_ff=3072,
-        max_seq_len=1024
+        max_seq_len=1024,
     )
 
-    # 2. 测试前向传播
     dummy_input = torch.randint(0, vocab_size, (batch_size, seq_len))
     logits = model(dummy_input)
-    print(f"前向传播输出形状: {logits.shape}")  # 预期: [2, 10, 50257]
+
+    print(f"输入形状: {dummy_input.shape}")
+    print(f"输出形状: {logits.shape}")
     print(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
 
-    # 3. 测试梯度
-    loss = logits.sum()
-    loss.backward()
-    print("梯度计算成功")
-
-    # 4. 测试不同序列长度
+    # 测试不同序列长度
     seq_len2 = 5
     dummy_input2 = torch.randint(0, vocab_size, (batch_size, seq_len2))
     logits2 = model(dummy_input2)
-    print(f"不同序列长度输出形状: {logits2.shape}")  # 预期: [2, 5, 50257]
+    print(f"不同序列长度输出形状: {logits2.shape}")
 
-    # 5. 导出ONNX（可选）
-    export_onnx = False  # 设置为True以启用ONNX导出
-    if export_onnx:
-        output_path = "onnx_data/gpt_rope_transformer.onnx"
-        export_to_onnx(model, dummy_input, output_path)
-
-        # 验证ONNX模型（可选）
-        import onnx
-        onnx_model = onnx.load(output_path)
-        onnx.checker.check_model(onnx_model)
-        print("ONNX模型验证通过")
-
-        sim_path = output_path.replace(".onnx", "_sim.onnx")
-        simplify_onnx(output_path, sim_path)
+    print("GPT Transformer with RoPE测试通过！")
 

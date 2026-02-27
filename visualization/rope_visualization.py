@@ -148,8 +148,10 @@ def visualize_rope(d_model: int = 64, seq_len: int = 50):
 
     # 调整布局，避免重叠
     plt.tight_layout()
-    # 保存图片（可选）
-    plt.savefig('rope_visualization.png', dpi=300, bbox_inches='tight')
+    # 保存图片到image目录
+    import os
+    os.makedirs('image', exist_ok=True)
+    plt.savefig('image/rope_visualization.png', dpi=300, bbox_inches='tight')
     # 显示图片
     plt.show()
 
