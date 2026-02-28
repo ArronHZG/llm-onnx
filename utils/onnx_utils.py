@@ -57,7 +57,7 @@ def export_to_onnx(
         onnx_path,
         export_params=True,
         opset_version=opset_version,
-        do_constant_folding=do_constant_folding,
+        do_constant_folding=False,
         input_names=input_names,
         output_names=output_names,
         dynamic_axes=dynamic_axes,
@@ -72,6 +72,7 @@ def simplify_onnx(
     onnx_path: str,
     output_path: Optional[str] = None,
     skip_if_fails: bool = True,
+    skipped_optimizers: Optional[list] = None,
 ) -> Optional[str]:
     """
     使用onnxsim简化ONNX模型
@@ -80,6 +81,7 @@ def simplify_onnx(
         onnx_path: 输入ONNX文件路径
         output_path: 输出ONNX文件路径（默认覆盖原文件）
         skip_if_fails: 如果简化失败是否跳过（不抛出异常）
+        skipped_optimizers: 需要跳过的优化器列表，例如 ['FuseMatMul'] 跳过 matmul 融合
 
     Returns:
         简化后的ONNX文件路径，如果失败则返回None
@@ -103,7 +105,10 @@ def simplify_onnx(
     model = onnx.load(onnx_path)
     check = False
     try:
-        model_simp, check = onnxsim.simplify(model)
+        model_simp, check = onnxsim.simplify(
+            model,
+            skipped_optimizers=skipped_optimizers,
+        )
     except Exception as e:
         logger.error(f"ONNX模型简化失败: {e}")
         if skip_if_fails:
@@ -125,6 +130,7 @@ def export_and_simplify(
     dummy_input: torch.Tensor,
     onnx_path: str,
     simplify: bool = True,
+    skipped_optimizers: Optional[list] = None,
     **export_kwargs,
 ) -> str:
     """
@@ -135,6 +141,7 @@ def export_and_simplify(
         dummy_input: 示例输入
         onnx_path: 输出ONNX文件路径
         simplify: 是否进行简化
+        skipped_optimizers: 需要跳过的优化器列表，例如 ['FuseMatMul'] 跳过 matmul 融合
         **export_kwargs: 传递给export_to_onnx的关键字参数
 
     Returns:
@@ -151,7 +158,7 @@ def export_and_simplify(
     # 简化模型（如果启用）
     if simplify:
         sim_path = onnx_path.replace(".onnx", "_sim.onnx")
-        simplified = simplify_onnx(onnx_path, sim_path)
+        simplified = simplify_onnx(onnx_path, sim_path, skipped_optimizers=skipped_optimizers)
         if simplified is not None:
             return simplified
 

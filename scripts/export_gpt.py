@@ -8,13 +8,13 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-from models.gpt import GPTTransformer
+from gpt import GPTTransformer
 from utils.onnx_utils import export_and_simplify, validate_onnx
 
 
 def main():
     # 配置参数
-    vocab_size = 50257  # GPT-2词汇表大小
+    vocab_size = 1234 # 50257  # GPT-2词汇表大小
     batch_size = 2
     seq_len = 10
 

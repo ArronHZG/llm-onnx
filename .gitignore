@@ -206,7 +206,8 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# custme
+# custom
+.DS_Store
 .idea
 *.onnx
 onnx_data

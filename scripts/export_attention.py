@@ -8,7 +8,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-from models.attention import MultiHeadAttention
+from attention import MultiHeadAttention
 from utils.onnx_utils import export_and_simplify, validate_onnx
 
 
