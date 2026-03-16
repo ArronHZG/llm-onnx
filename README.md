@@ -19,23 +19,19 @@ llm-onnx/
 
 ## 模型实现
 
-### 1. GPT Transformer (`gpt.py`)
+* RMSNorm 使用 LayerNorm 替换
+* SwiGLU, GeLU 使用 ReLU 替换
+* 固定 dims 参数
 
-- 多头自注意力 + 因果掩码
-- 绝对位置嵌入
-- Pre-LN结构
-- 前馈网络
-
-### 2. GPT + RoPE (`gpt_rope.py`)
-
-- 旋转位置编码（Rotary Position Embedding）
-- 相比绝对位置编码，RoPE具有更好的外推能力
-
-### 3. GPT + MoE (`gpt_moe.py`)
-
-- 专家混合（Mixture of Experts）
-- 稀疏门控机制
-- Top-K专家路由
+| 文件             | 模型              | 特点                                        |
+|----------------|-----------------|-------------------------------------------|
+| `attention.py` | 基础Attention     | 标准的Multi-Head Attention实现                 |
+| `gpt.py`       | GPT Transformer | 多头自注意力 + 因果掩码、绝对位置嵌入、Pre-LN结构、前馈网络        |
+| `gpt_rope.py`  | GPT + RoPE      | 旋转位置编码（Rotary Position Embedding），更好的外推能力 |
+| `gpt_moe.py`   | GPT + MoE       | 专家混合（Mixture of Experts）、稀疏门控机制、Top-K专家路由 |
+| `qwen3_dense.py` | Qwen3 Dense    | RoPE、GQA(Grouped Query Attention)、SwiGLU激活 |
+| `qwen3_moe.py` | Qwen3 MoE       | (待实现) |
+| `deepseekv3.py` | DeepSeek V3     | (待实现) |
 
 ## 安装依赖
 
