@@ -110,12 +110,12 @@ class MultiHeadAttentionWithRoPE(nn.Module):
         # 初始化RoPE位置编码
 
         # 线性投影并拆分多头: [batch_size, seq_len, n_heads, d_k]
-        b, seq_len, _ = x.shape  # b = batch_size, n_tokens = seq_len
+        batch_size, seq_len, _ = x.shape  # b = batch_size, n_tokens = seq_len
 
         # 线性投影并拆分多头: [batch_size, seq_len, n_heads, d_k]
-        q = self.w_q(x).view(b, seq_len, self.n_heads, self.d_k).transpose(1, 2)
-        k = self.w_k(x).view(b, seq_len, self.n_heads, self.d_k).transpose(1, 2)
-        v = self.w_v(x).view(b, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        q = self.w_q(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        k = self.w_k(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        v = self.w_v(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
 
         # 应用旋转位置编码
         q_rot, k_rot = apply_rotary_pos_emb(q, k,

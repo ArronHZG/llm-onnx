@@ -211,3 +211,4 @@ __marimo__/
 .idea
 *.onnx
 onnx_data
+minimind
