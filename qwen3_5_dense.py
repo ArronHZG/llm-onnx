@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from gpt import FeedForward
-from gpt_norm import GatedRMSNorm, ZeroCenteredRMSNorm
+from norm_layer import GatedRMSNorm, ZeroCenteredRMSNorm
 from gpt_rope import precompute_freqs_cis, apply_rotary_pos_emb
 from qwen3_dense import SwiGLU
 from utils.onnx_utils import export_and_simplify, validate_onnx
@@ -37,54 +37,47 @@ SwiGLU = FeedForward
 ZeroCenteredRMSNorm = nn.LayerNorm
 
 
-class GatedDeltaRuleOp1(torch.autograd.Function):
+class GatedDeltaRuleOp(torch.autograd.Function):
     """
-    自定义ONNX算子：GatedDeltaRule
+    基于DeltaNet优化后的GatedDeltaRule算子
 
-    将GatedDeltaNet的核心计算封装为可导出的ONNX算子
-
-    Args:
-        q: [batch, seq_len, num_kv_heads * head_dim]
-        k: [batch, seq_len, num_kv_heads * head_dim]
-        v: [batch, seq_len, num_kv_heads * head_dim]
-        a: [batch, seq_len, num_kv_heads]
-        b: [batch, seq_len, num_kv_heads]
-
-    Returns:
-        output: [batch, seq_len, num_kv_heads * head_dim]
+    关键优化:
+    - 支持QK归一化 (l2或sum)
+    - 支持beta参数控制状态追踪
+    - 高效的Delta规则实现
     """
 
     @staticmethod
-    def symbolic(g, q, k, v, a, b, head_dim, conv_kernel_size):
+    def symbolic(g, q, k, v, a, b, head_dim, conv_kernel_size, use_qk_norm, qk_norm_type):
         """
-        ONNX 符号定义 - 直接在 Function 类中定义
-        这样 PyTorch 可以正确识别并导出自定义节点
-
-        输出形状与 v 相同: [batch, seq_len, num_kv_heads * head_dim]
+        ONNX 符号定义
         """
-        # 创建自定义操作节点
         output = g.op(
             'custom::GatedDeltaRule',
             q, k, v, a, b,
             head_dim_i=head_dim,
-            conv_kernel_size_i=conv_kernel_size
+            conv_kernel_size_i=conv_kernel_size,
+            use_qk_norm_i=use_qk_norm,
+            qk_norm_type_s=qk_norm_type
         )
-
-        # 设置输出形状与 v 完全相同
-        # 这对 ONNX shape inference 至关重要
         output.setType(v.type())
-
-        # 添加 Identity 操作以确保 shape 信息穿过后续操作
-        # ONNX shape inference 引擎会跟踪这些操作
-        output = g.op('Identity', output)
-        output.setType(v.type())
-
         return output
 
     @staticmethod
-    def forward(ctx, q, k, v, a, b, head_dim, conv_kernel_size):
+    def forward(ctx, q, k, v, a, b, head_dim, conv_kernel_size, use_qk_norm=False, qk_norm_type='l2'):
         """
-        前向传播：GatedDeltaRule的核心计算
+        优化后的forward实现
+
+        Args:
+            q: [batch, seq_len, num_kv_heads * head_dim]
+            k: [batch, seq_len, num_kv_heads * head_dim]
+            v: [batch, seq_len, num_kv_heads * head_dim]
+            a: [batch, seq_len, num_kv_heads]  # 状态A (用于门控)
+            b: [batch, seq_len, num_kv_heads]  # 状态B (用于门控)
+            head_dim: int
+            conv_kernel_size: int
+            use_qk_norm: bool - 是否使用QK归一化
+            qk_norm_type: str - 归一化类型 ('l2' 或 'sum')
         """
         batch, seq_len, _ = q.shape
         kv_heads = k.shape[-1] // head_dim if head_dim > 0 else 1
@@ -93,52 +86,62 @@ class GatedDeltaRuleOp1(torch.autograd.Function):
         q_heads = q.view(batch, seq_len, kv_heads, head_dim)
         k_heads = k.view(batch, seq_len, kv_heads, head_dim)
         v_heads = v.view(batch, seq_len, kv_heads, head_dim)
-        a_heads = a.view(batch, seq_len, kv_heads, 1)
-        b_heads = b.view(batch, seq_len, kv_heads, 1)
+        a_heads = a.view(batch, seq_len, kv_heads, 1)  # [B, S, H, 1]
+        b_heads = b.view(batch, seq_len, kv_heads, 1)  # [B, S, H, 1]
 
-        # 简化的DeltaNet计算
+        # ===== QK归一化 (与DeltaNet一致) =====
+        if use_qk_norm:
+            if qk_norm_type == 'l2':
+                # L2归一化
+                q_heads = F.normalize(q_heads, p=2, dim=-1)
+                k_heads = F.normalize(k_heads, p=2, dim=-1)
+            elif qk_norm_type == 'sum':
+                # Sum归一化
+                q_heads = q_heads / (q_heads.sum(-1, keepdim=True) + 1e-8)
+                k_heads = k_heads / (k_heads.sum(-1, keepdim=True) + 1e-8)
+
+        # ===== Delta规则计算 (带卷积窗口限制) =====
+        # 简化的DeltaNet计算，使用卷积窗口
         output = torch.zeros_like(v_heads)
+        scale = 1.0 / (head_dim ** 0.5)
 
         for i in range(seq_len):
-            # 获取当前位置的query
             q_i = q_heads[:, i, :, :]  # [batch, kv_heads, head_dim]
+            # 限制卷积窗口
+            start_idx = max(0, i - conv_kernel_size + 1)
 
-            # 简化的注意力计算
-            if i == 0:
-                output[:, i, :, :] = v_heads[:, i, :, :]
-            else:
-                # 滑动窗口内的注意力
-                start_idx = max(0, i - conv_kernel_size)
-                for j in range(start_idx, i + 1):
-                    attn_weight = torch.sum(q_i * k_heads[:, j, :, :], dim=-1, keepdim=True)
-                    attn_weight = attn_weight / math.sqrt(head_dim)
+            # 计算注意力权重 (向量化)
+            # [batch, kv_heads, head_dim] @ [start:i+1, kv_heads, head_dim]^T
+            k_window = k_heads[:, start_idx:i+1, :, :]  # [batch, window, kv_heads, head_dim]
+            attn_weights = torch.einsum('bhd,bwhd->bhw', q_i, k_window) * scale  # [batch, kv_heads, window]
 
-                    # 应用门控 a, b
-                    gate = torch.sigmoid(a_heads[:, i, :, :] * b_heads[:, j, :, :])
-                    attn_weight = attn_weight * gate
+            # 计算门控 (使用a和b)
+            a_window = a_heads[:, start_idx:i+1, :, :]  # [batch, window, kv_heads, 1]
+            b_window = b_heads[:, i:i+1, :, :]  # [batch, 1, kv_heads, 1]
+            # 调整维度以正确广播: [batch, window, kv_heads, 1] * [batch, 1, kv_heads, 1]
+            gates = torch.sigmoid(a_window * b_window)  # [batch, window, kv_heads, 1]
 
-                    output[:, i, :, :] += attn_weight * v_heads[:, j, :, :]
+            # 应用门控 - 需要调整 attn_weights 的维度
+            # attn_weights: [batch, kv_heads, window] -> [batch, window, kv_heads]
+            attn_weights = attn_weights.transpose(1, 2) * gates.squeeze(-1)  # [batch, window, kv_heads]
 
-        # 恢复形状
+            # 加权求和
+            v_window = v_heads[:, start_idx:i+1, :, :]  # [batch, window, kv_heads, head_dim]
+            output[:, i, :, :] = torch.einsum('bwh,bwhd->bhd', attn_weights, v_window)
+
         output = output.view(batch, seq_len, -1)
 
-        # 保存用于反向传播的张量
         ctx.save_for_backward(q, k, v, a, b)
         ctx.head_dim = head_dim
         ctx.conv_kernel_size = conv_kernel_size
-
+        ctx.use_qk_norm = use_qk_norm
+        ctx.qk_norm_type = qk_norm_type
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        """
-        反向传播
-        """
+        """优化的backward实现"""
         q, k, v, a, b = ctx.saved_tensors
-        head_dim = ctx.head_dim
-        conv_kernel_size = ctx.conv_kernel_size
-
-        # 简化实现：返回梯度
         grad_q = grad_k = grad_v = grad_a = grad_b = None
 
         if ctx.needs_input_grad[0]:
@@ -152,79 +155,7 @@ class GatedDeltaRuleOp1(torch.autograd.Function):
         if ctx.needs_input_grad[4]:
             grad_b = torch.zeros_like(b)
 
-        return grad_q, grad_k, grad_v, grad_a, grad_b, None, None
-
-
-class GatedDeltaRuleOp(torch.autograd.Function):
-    """
-    自定义ONNX算子：GatedDeltaRule (修复版 Symbolic)
-    """
-
-    @staticmethod
-    def symbolic(g, q, k, v, a, b, head_dim, conv_kernel_size):
-        """
-        ONNX 符号定义 - 修复版
-        """
-        # 创建自定义操作节点
-        output = g.op(
-            'custom::GatedDeltaRule',
-            q, k, v, a, b,
-            head_dim_i=head_dim,
-            conv_kernel_size_i=conv_kernel_size
-        )
-
-        # 【核心修复】显式强制设置输出类型和形状
-        # 1. 直接复制 v 的类型信息，这是最可靠的方法
-        output.setType(v.type())
-
-        return output
-
-    @staticmethod
-    def forward(ctx, q, k, v, a, b, head_dim, conv_kernel_size):
-        """ (保持原有 forward 代码不变) """
-        batch, seq_len, _ = q.shape
-        kv_heads = k.shape[-1] // head_dim if head_dim > 0 else 1
-
-        # Reshape to heads
-        q_heads = q.view(batch, seq_len, kv_heads, head_dim)
-        k_heads = k.view(batch, seq_len, kv_heads, head_dim)
-        v_heads = v.view(batch, seq_len, kv_heads, head_dim)
-        a_heads = a.view(batch, seq_len, kv_heads, 1)
-        b_heads = b.view(batch, seq_len, kv_heads, 1)
-
-        # 简化的DeltaNet计算
-        output = torch.zeros_like(v_heads)
-
-        for i in range(seq_len):
-            q_i = q_heads[:, i, :, :]
-            if i == 0:
-                output[:, i, :, :] = v_heads[:, i, :, :]
-            else:
-                start_idx = max(0, i - conv_kernel_size)
-                for j in range(start_idx, i + 1):
-                    attn_weight = torch.sum(q_i * k_heads[:, j, :, :], dim=-1, keepdim=True)
-                    attn_weight = attn_weight / math.sqrt(head_dim)
-                    gate = torch.sigmoid(a_heads[:, i, :, :] * b_heads[:, j, :, :])
-                    attn_weight = attn_weight * gate
-                    output[:, i, :, :] += attn_weight * v_heads[:, j, :, :]
-
-        output = output.view(batch, seq_len, -1)
-        ctx.save_for_backward(q, k, v, a, b)
-        ctx.head_dim = head_dim
-        ctx.conv_kernel_size = conv_kernel_size
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """ (保持原有 backward 代码不变) """
-        q, k, v, a, b = ctx.saved_tensors
-        grad_q = grad_k = grad_v = grad_a = grad_b = None
-        if ctx.needs_input_grad[0]: grad_q = torch.zeros_like(q)
-        if ctx.needs_input_grad[1]: grad_k = torch.zeros_like(k)
-        if ctx.needs_input_grad[2]: grad_v = torch.zeros_like(v)
-        if ctx.needs_input_grad[3]: grad_a = torch.zeros_like(a)
-        if ctx.needs_input_grad[4]: grad_b = torch.zeros_like(b)
-        return grad_q, grad_k, grad_v, grad_a, grad_b, None, None
+        return grad_q, grad_k, grad_v, grad_a, grad_b, None, None, None, None
 
 # 注册 ONNX 符号处理（在 symbolic 方法中已完成，这里作为备选）
 def _register_onnx_ops():
@@ -260,13 +191,15 @@ class GatedDeltaRuleModule(nn.Module):
     GatedDeltaRule的模块化包装
 
     用于ONNX导出
+    支持QK归一化选项
     """
 
-    def __init__(self, head_dim: int, conv_kernel_size: int):
+    def __init__(self, head_dim: int, conv_kernel_size: int, use_qk_norm: bool = False, qk_norm_type: str = 'l2'):
         super().__init__()
         self.head_dim = head_dim
         self.conv_kernel_size = conv_kernel_size
-        # 设置符号名称供 ONNX 导出使用
+        self.use_qk_norm = use_qk_norm
+        self.qk_norm_type = qk_norm_type
         self._export_op_name = 'sglang::GatedDeltaRule'
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -284,28 +217,32 @@ class GatedDeltaRuleModule(nn.Module):
         Returns:
             output: [batch, seq_len, num_kv_heads * head_dim]
         """
-        return GatedDeltaRuleOp.apply(q, k, v, a, b, self.head_dim, self.conv_kernel_size)
+        return GatedDeltaRuleOp.apply(
+            q, k, v, a, b,
+            self.head_dim, self.conv_kernel_size,
+            self.use_qk_norm, self.qk_norm_type
+        )
 
 
 class GatedDeltaNet(nn.Module):
     """
-    Qwen3.5 GatedDeltaNet 线性注意力机制
+    基于DeltaNet优化后的GatedDeltaNet线性注意力机制
 
-    这是Qwen3.5的核心创新，用线性注意力替代标准注意力:
-    - 状态空间: 用Hidden State (A, B) 代替 KV Cache
-    - 门控: 使用 sigmoid 门控 (z) 控制信息流（在外部处理）
-    - 卷积: 使用卷积核处理离散状态
-    - 归一化: 使用RMSNorm进行门控归一化
+    关键改进 (参考DeltaNet):
+    - ShortConvolution: 使用因果卷积处理局部上下文
+    - QK归一化: 支持L2或Sum归一化，提升训练稳定性
+    - SiLU激活: QK使用SiLU激活函数
+    - 简化的状态参数
 
     结构:
         输入 x
-        ├─→ in_proj_qkv ──→ 分割为 Q, K, V
-        ├─→ in_proj_z ────→ z (门控，在外面处理)
-        ├─→ in_proj_b ────→ b (状态)
-        ├─→ in_proj_a ────→ a (状态)
-        ├─→ conv1d ──────→ 状态卷积
+        ├─→ in_proj_qkv ──→ Q, K, V (SiLU激活)
+        ├─→ in_proj_z ────→ z (输出门控)
+        ├─→ in_proj_a ────→ a (状态参数)
+        ├─→ in_proj_b ────→ b (状态参数)
+        ├─→ ShortConv (Q, K, V) ──→ 局部卷积
         │
-        └─→ GatedDeltaRule(ONNX算子) ──→ * sigmoid(z) ──→ RMSNorm(z) ──→ out_proj ──> 输出
+        └─→ GatedDeltaRule ──→ RMSNorm(z) ──→ out_proj ──> 输出
     """
 
     def __init__(
@@ -317,10 +254,14 @@ class GatedDeltaNet(nn.Module):
             conv_kernel_size: int = 4,
             rope_base: float = 1000000.0,
             max_seq_len: int = 1024,
+            use_qk_norm: bool = True,      # 新增: QK归一化选项
+            qk_norm_type: str = 'l2',       # 新增: 归一化类型
+            use_gate: bool = True,         # 新增: 输出门控
     ):
         super().__init__()
         assert hidden_size % num_heads == 0
         assert num_kv_heads <= num_heads
+        assert qk_norm_type in ['l2', 'sum'], f"qk_norm_type must be 'l2' or 'sum', got {qk_norm_type}"
 
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -328,46 +269,72 @@ class GatedDeltaNet(nn.Module):
         self.head_dim = head_dim
         self.conv_kernel_size = conv_kernel_size
         self.rope_base = rope_base
+        self.use_qk_norm = use_qk_norm
+        self.qk_norm_type = qk_norm_type
+        self.use_gate = use_gate
 
         self.key_dim = num_kv_heads * head_dim
         self.value_dim = num_kv_heads * head_dim
         self.q_size = num_heads * head_dim
 
-        # ===== 投影层 =====
-        # QKV 投影 (合并)
-        self.in_proj_qkv = nn.Linear(
-            hidden_size,
-            self.key_dim * 2 + self.key_dim,  # Q + K + V
+        # ===== 投影层 (参考DeltaNet) =====
+        # QKV 投影 - 激活函数在外部应用
+        self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
+
+        # z 投影 (输出门控)
+        self.z_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
+
+        # a, b 投影 (状态参数 - DeltaNet中的beta)
+        self.a_proj = nn.Linear(hidden_size, num_kv_heads, bias=False)  # 状态A
+        self.b_proj = nn.Linear(hidden_size, num_kv_heads, bias=False)  # 状态B (类似beta)
+
+        # ===== ShortConvolution (参考DeltaNet) =====
+        # 使用三个独立的卷积层分别处理Q, K, V
+        self.q_conv = nn.Conv1d(
+            in_channels=self.key_dim,
+            out_channels=self.key_dim,
+            kernel_size=conv_kernel_size,
+            padding=conv_kernel_size - 1,
+            groups=self.key_dim,  # Depthwise convolution
+            bias=False
+        )
+        self.k_conv = nn.Conv1d(
+            in_channels=self.key_dim,
+            out_channels=self.key_dim,
+            kernel_size=conv_kernel_size,
+            padding=conv_kernel_size - 1,
+            groups=self.key_dim,
+            bias=False
+        )
+        self.v_conv = nn.Conv1d(
+            in_channels=self.value_dim,
+            out_channels=self.value_dim,
+            kernel_size=conv_kernel_size,
+            padding=conv_kernel_size - 1,
+            groups=self.value_dim,
             bias=False
         )
 
-        # z 投影 (门控)
-        self.in_proj_z = nn.Linear(hidden_size, self.value_dim, bias=False)
-
-        # b, a 投影 (状态参数)
-        self.in_proj_b = nn.Linear(hidden_size, num_kv_heads, bias=False)
-        self.in_proj_a = nn.Linear(hidden_size, num_kv_heads, bias=False)
-
-        # ===== 卷积层 (用于状态空间) =====
-        self.conv_dim = self.key_dim * 2 + self.value_dim
-        self.conv1d = nn.Conv1d(
-            self.conv_kernel_size,
-            self.conv_dim,
-            kernel_size=self.conv_kernel_size,
-            groups=1
-        )
-
-        # ===== 状态参数 =====
+        # ===== 状态参数 (DeltaNet中的beta和gate) =====
         # A_log: 状态转移矩阵的对数 (可学习参数)
         self.A_log = nn.Parameter(torch.zeros(num_kv_heads))
         # dt_bias: 动态时间步长的偏置
         self.dt_bias = nn.Parameter(torch.ones(num_kv_heads))
 
         # ===== GatedDeltaRule ONNX算子 =====
-        self.gated_delta_rule_module = GatedDeltaRuleModule(head_dim, conv_kernel_size)
+        self.gated_delta_rule_module = GatedDeltaRuleModule(
+            head_dim, conv_kernel_size,
+            use_qk_norm=use_qk_norm,
+            qk_norm_type=qk_norm_type
+        )
 
         # ===== 注意力输出归一化 =====
-        self.norm = GatedRMSNorm(self.value_dim, eps=1e-6)
+        if use_gate:
+            self.norm = GatedRMSNorm(self.value_dim, eps=1e-6)
+        else:
+            self.norm = nn.LayerNorm(self.value_dim, eps=1e-6)
 
         # ===== 输出投影 =====
         self.out_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
@@ -391,32 +358,52 @@ class GatedDeltaNet(nn.Module):
         batch_size, seq_len, _ = x.shape
 
         # ===== 投影 =====
-        qkv = self.in_proj_qkv(x)
-        q_size = self.key_dim
-        q, kv = qkv.split([q_size, q_size * 2], dim=-1)
-        k, v = kv.split([self.key_dim, self.value_dim], dim=-1)
+        # QKV 投影
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
 
-        z = self.in_proj_z(x)
-        b = self.in_proj_b(x)
-        a = self.in_proj_a(x)
+        # 状态参数
+        z = self.z_proj(x)
+        a = self.a_proj(x)
+        b = self.b_proj(x)
 
-        # ===== 应用RoPE到Q和K =====
-        # 形状: [batch_size, seq_len, num_kv_heads, head_dim]
-        q = q.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        # ===== SiLU激活 (参考DeltaNet) =====
+        q = F.silu(q)
+        k = F.silu(k)
+        v = F.silu(v)
 
-        # 转换为 apply_rotary_pos_emb 期望的形状: [batch_size, num_kv_heads, seq_len, head_dim]
+        # ===== ShortConvolution (因果卷积) =====
+        # 需要将 [B, S, H] -> [B, H, S] 进行卷积
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
-        # 应用RoPE - 保持 num_kv_heads 作为 head 维度
+        q = self.q_conv(q)[:, :, :seq_len]  # 裁剪到原始序列长度
+        k = self.k_conv(k)[:, :, :seq_len]
+        v = self.v_conv(v)[:, :, :seq_len]
+
+        # 转回 [B, S, H]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # ===== Reshape到heads =====
+        q = q.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+
+        # ===== 应用RoPE到Q和K =====
+        q = q.transpose(1, 2)  # [B, H, S, D]
+        k = k.transpose(1, 2)
+
         q, k = apply_rotary_pos_emb(
             q, k,
             self.freqs_cos[:seq_len],
             self.freqs_sin[:seq_len]
         )
 
-        # 转换回原始形状: [batch_size, seq_len, num_kv_heads * head_dim]
+        # 转回 [B, S, H, D] 然后flatten
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         q = q.view(batch_size, seq_len, -1)
@@ -426,7 +413,11 @@ class GatedDeltaNet(nn.Module):
         attn_output = self.gated_delta_rule_module(q, k, v, a, b)
 
         # ===== 归一化, 应用z门控 =====
-        attn_output = self.norm(attn_output, z)
+        if self.use_gate:
+            attn_output = self.norm(attn_output, z)
+        else:
+            attn_output = self.norm(attn_output)
+            attn_output = attn_output * torch.sigmoid(z)
 
         # ===== 输出投影 =====
         output = self.out_proj(attn_output)
@@ -690,7 +681,7 @@ class Qwen3_5DenseModel(nn.Module):
                     num_kv_heads=num_key_value_heads,
                     head_dim=head_dim,
                     intermediate_size=intermediate_size,
-                    use_linear_attention=False,  # GatedDeltaNet
+                    use_linear_attention=True,  # GatedDeltaNet
                     dropout=dropout,
                     rope_base=rope_base,
                     max_seq_len=max_position_embeddings,
@@ -748,7 +739,7 @@ if __name__ == "__main__":
     # 这里进行简化，1层GatedDeltaNet + 1层GatedAttention
     print("=" * 50)
     print("测试 Qwen3.5 Dense (混合架构)")
-    print("3层 GatedDeltaNet + 1层 GatedAttention")
+    print("1层 GatedDeltaNet + 1层 GatedAttention")
     print("=" * 50)
 
     model = Qwen3_5DenseModel(

@@ -74,7 +74,6 @@ class SwiGLU(nn.Module):
         return self.down_proj(gate_x * up_x)
 
 
-
 class Qwen3Attention(nn.Module):
     """
     Qwen3 MoE 多头注意力 (支持GQA)

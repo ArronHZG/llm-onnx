@@ -213,3 +213,4 @@ __marimo__/
 onnx_data
 minimind
 sglang
+flash-linear-attention
