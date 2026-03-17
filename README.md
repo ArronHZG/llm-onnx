@@ -30,7 +30,7 @@ llm-onnx/
 | `gpt_rope.py`  | GPT + RoPE      | 旋转位置编码（Rotary Position Embedding），更好的外推能力 |
 | `gpt_moe.py`   | GPT + MoE       | 专家混合（Mixture of Experts）、稀疏门控机制、Top-K专家路由 |
 | `qwen3_dense.py` | Qwen3 Dense    | RoPE、GQA(Grouped Query Attention)、SwiGLU激活 |
-| `qwen3_moe.py` | Qwen3 MoE       | (待实现) |
+| `qwen3_moe.py` | Qwen3 MoE       | RoPE、GQA、QK归一化、MoE(8专家+Top2路由)、SwiGLU |
 | `deepseekv3.py` | DeepSeek V3     | (待实现) |
 
 ## 安装依赖
@@ -57,19 +57,6 @@ python -m visualization.rope_visualization
 
 # 可视化位置编码
 python -m visualization.positional_encoding_visualization
-```
-
-### 直接运行
-
-```bash
-# 测试GPT模型
-python gpt.py
-
-# 测试RoPE版本
-python gpt_rope.py
-
-# 测试MoE版本
-python gpt_moe.py
 ```
 
 ## 配置参数
