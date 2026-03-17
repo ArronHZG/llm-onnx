@@ -59,13 +59,22 @@ class GatedDeltaRuleOp(torch.autograd.Function):
         """
         ONNX 符号定义 - 直接在 Function 类中定义
         这样 PyTorch 可以正确识别并导出自定义节点
+
+        输出形状与 v 相同: [batch, seq_len, num_kv_heads * head_dim]
         """
-        return g.op(
-            'sglang::GatedDeltaRule',
+        # 创建自定义操作节点，输出类型与 v 相同
+        # 这样 ONNX 就能正确推断输出形状
+        output = g.op(
+            'custom::GatedDeltaRule',
             q, k, v, a, b,
             head_dim_i=head_dim,
             conv_kernel_size_i=conv_kernel_size
         )
+
+        # 设置输出形状与 v 相同
+        # 使用 set_type 显式设置类型以确保 shape 信息被保留
+        output.setType(v.type())
+        return output
 
     @staticmethod
     def forward(ctx, q, k, v, a, b, head_dim, conv_kernel_size):
@@ -141,49 +150,32 @@ class GatedDeltaRuleOp(torch.autograd.Function):
         return grad_q, grad_k, grad_v, grad_a, grad_b, None, None
 
 
-# ===== ONNX 算子注册 =====
-def gated_delta_rule_onnx_symbolic(g, q, k, v, a, b, head_dim, conv_kernel_size):
-    """
-    GatedDeltaRuleOp 的 ONNX 符号表达
-
-    这个函数将自定义 PyTorch 算子转换为 ONNX 格式
-    创建一个自定义操作节点在 ONNX 中
-    """
-    # 直接创建自定义 ONNX 操作节点，保留在导出的模型中
-    # domain 参数指定自定义操作所属的命名空间
-    return g.op(
-        'sglang::GatedDeltaRule',
-        q, k, v, a, b,
-        head_dim_i=head_dim,
-        conv_kernel_size_i=conv_kernel_size
-    )
-
-
-# 在模块加载时注册 ONNX 符号
-def _register_onnx_symbolic():
-    """注册 GatedDeltaRuleOp 的 ONNX 符号"""
+# 注册 ONNX 符号处理（在 symbolic 方法中已完成，这里作为备选）
+def _register_onnx_ops():
+    """注册 GatedDeltaRuleOp 的 ONNX 符号处理"""
     try:
-        # 对于 PyTorch 1.12+ 版本
         from torch.onnx import register_custom_op_symbolic
+
+        def symbolic_gated_delta_rule(g, q, k, v, a, b, head_dim, conv_kernel_size):
+            """GatedDeltaRuleOp 的 ONNX 符号处理"""
+            output = g.op(
+                'custom::GatedDeltaRule',
+                q, k, v, a, b,
+                head_dim_i=head_dim,
+                conv_kernel_size_i=conv_kernel_size
+            )
+            # 使用 Identity 帮助形状推断
+            return g.op('Identity', output)
+
         register_custom_op_symbolic(
             'custom::gated_delta_rule_op',
-            gated_delta_rule_onnx_symbolic,
+            symbolic_gated_delta_rule,
             opset_version=14
         )
-    except (ImportError, AttributeError):
-        try:
-            # 对于早期版本，尝试直接注册到 torch._C._jit_get_custom_op_schema
-            import torch.onnx.symbolic as sym
-            sym.register_custom_op_symbolic(
-                'custom::gated_delta_rule_op',
-                gated_delta_rule_onnx_symbolic,
-                14
-            )
-        except Exception:
-            pass
+    except Exception:
+        pass
 
-# 在导入时尝试注册
-_register_onnx_symbolic()
+_register_onnx_ops()
 
 
 class GatedDeltaRuleModule(nn.Module):
@@ -311,33 +303,6 @@ class GatedDeltaNet(nn.Module):
         self.register_buffer('freqs_cos', freqs_cos, persistent=False)
         self.register_buffer('freqs_sin', freqs_sin, persistent=False)
 
-    def gated_delta_rule(
-            self,
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            a: torch.Tensor,
-            b: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        GatedDeltaNet 核心计算
-
-        这是一个简化的实现，用于ONNX导出
-        实际sglang版本使用Triton kernel进行高度优化
-
-        Args:
-            q: [batch, seq_len, num_heads * head_dim]
-            k: [batch, seq_len, num_kv_heads * head_dim]
-            v: [batch, seq_len, num_kv_heads * head_dim]
-            a: [batch, seq_len, num_kv_heads]
-            b: [batch, seq_len, num_kv_heads]
-
-        Returns:
-            output: [batch, seq_len, num_kv_heads * head_dim] (未应用z门控)
-        """
-        # 使用ONNX算子进行计算
-        return self.gated_delta_rule_module(q, k, v, a, b)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -380,18 +345,10 @@ class GatedDeltaNet(nn.Module):
         k = k.view(batch_size, seq_len, -1)
 
         # ===== GatedDeltaRule 计算 =====
-        attn_output = self.gated_delta_rule(q, k, v, a, b)
-
-        # ===== 在外部应用z门控 =====
-        # z的sigmoid门控在这里应用，与GatedDeltaRule分离
-        z_gate = torch.sigmoid(z)  # [batch_size, seq_len, value_dim]
-        attn_output = attn_output * z_gate  # 元素级乘法
+        attn_output = self.gated_delta_rule_module(q, k, v, a, b)
 
         # ===== 归一化 =====
-        attn_output = attn_output.view(batch_size * seq_len, -1)
-        z_reshaped = z.view(batch_size * seq_len, -1)
-        attn_output = self.norm(attn_output, z_reshaped)
-        attn_output = attn_output.view(batch_size, seq_len, -1)
+        attn_output = self.norm(attn_output, z)
 
         # ===== 输出投影 =====
         output = self.out_proj(attn_output)

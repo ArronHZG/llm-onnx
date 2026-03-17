@@ -51,7 +51,6 @@ class GatedRMSNorm(nn.Module):
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
-        self.hidden_size = hidden_size
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
@@ -64,18 +63,12 @@ class GatedRMSNorm(nn.Module):
             output: 归一化后的张量 [..., hidden_size]
         """
         # 计算RMS
-        input_shape = x.shape
-        x = x.reshape(-1, x.shape[-1])
         rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         # 归一化并乘以权重
-        x = x * rms * self.weight
+        x = x * rms * (1.0 + self.weight)
 
         # 如果提供了门控z，应用门控
         if z is not None:
-            z = z.reshape(-1, z.shape[-1])
             x = x * torch.sigmoid(z)
 
-        return x.reshape(input_shape)
-
-
-
+        return x
