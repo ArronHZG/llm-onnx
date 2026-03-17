@@ -37,14 +37,37 @@ llm-onnx/
 
 ## 可视化结果
 
+以下展示了各模型架构的计算图可视化：
+
+### GPT系列模型
+
 ![GPT Transformer](image/gpt_transformer_sim.png)
+**GPT Transformer**：基础Transformer架构，包含多头自注意力机制和前馈网络，采用绝对位置嵌入。
+
 ![GPT RoPE](image/gpt_transformer_rope_sim.png)
+**GPT + RoPE**：使用旋转位置编码（Rotary Position Embedding）替代绝对位置嵌入，提升位置外推能力。
+
 ![GPT MoE](image/gpt_transformer_moe_sim.png)
+**GPT + MoE**：引入专家混合（Mixture of Experts）机制，通过稀疏门控选择Top-K专家进行计算。
+
+### Qwen3系列模型
+
 ![Qwen3 Dense](image/qwen3_dense_sim.png)
+**Qwen3 Dense**：采用RoPE旋转位置编码、GQA（分组查询注意力）和SwiGLU激活函数。
+
 ![Qwen3 MoE](image/qwen3_moe_sim.png)
+**Qwen3 MoE**：在Dense基础上引入MoE结构，8个专家+Top-2路由机制。
+
 ![Qwen3.5 Dense](image/qwen3_5_dense_sim.png)
+**Qwen3.5 Dense**：包含零中心化RMSNorm、门控注意力机制。
+
+### 位置编码可视化
+
 ![RoPE Visualization](image/rope_visualization.png)
+**RoPE可视化**：展示旋转位置编码的工作原理，左图为位置嵌入的热力图可视化，右图为旋转矩阵的实部和虚部。
+
 ![Positional Encoding](image/positional_encoding_visualization.png)
+**位置编码对比**：对比绝对位置编码与旋转位置编码的差异，展示不同位置编码方式对token位置信息的表示。
 
 ## 安装依赖
 
