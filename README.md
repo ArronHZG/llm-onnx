@@ -37,6 +37,15 @@ llm-onnx/
 
 ## 可视化结果
 
+![GPT Transformer](image/gpt_transformer_sim.png)
+![GPT RoPE](image/gpt_transformer_rope_sim.png)
+![GPT MoE](image/gpt_transformer_moe_sim.png)
+![Qwen3 Dense](image/qwen3_dense_sim.png)
+![Qwen3 MoE](image/qwen3_moe_sim.png)
+![Qwen3.5 Dense](image/qwen3_5_dense_sim.png)
+![RoPE Visualization](image/rope_visualization.png)
+![Positional Encoding](image/positional_encoding_visualization.png)
+
 ## 安装依赖
 
 ```bash
