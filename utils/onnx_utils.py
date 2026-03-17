@@ -101,8 +101,19 @@ def simplify_onnx(
 
     logger.info(f"正在简化ONNX模型: {onnx_path}")
 
-    # 加载并简化模型
+    # 加载模型
     model = onnx.load(onnx_path)
+
+    # 尝试进行 shape 推断以改善 shape 信息
+    try:
+        logger.info("正在进行 ONNX shape inference...")
+        from onnx.shape_inference import infer_shapes
+        model = infer_shapes(model)
+        logger.info("Shape inference 完成")
+    except Exception as e:
+        logger.warning(f"Shape inference 失败: {e}")
+        # 继续进行简化，即使 shape inference 失败
+
     check = False
     try:
         model_simp, check = onnxsim.simplify(

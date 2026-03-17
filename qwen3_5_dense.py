@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from gpt import FeedForward
-from gpt_norm import GatedRMSNorm
+from gpt_norm import GatedRMSNorm, ZeroCenteredRMSNorm
 from gpt_rope import precompute_freqs_cis, apply_rotary_pos_emb
 from qwen3_dense import SwiGLU
 from utils.onnx_utils import export_and_simplify, validate_onnx
@@ -62,18 +62,16 @@ class GatedDeltaRuleOp(torch.autograd.Function):
 
         输出形状与 v 相同: [batch, seq_len, num_kv_heads * head_dim]
         """
-        # 创建自定义操作节点，输出类型与 v 相同
-        # 这样 ONNX 就能正确推断输出形状
+        # 创建自定义操作节点
         output = g.op(
             'custom::GatedDeltaRule',
             q, k, v, a, b,
             head_dim_i=head_dim,
             conv_kernel_size_i=conv_kernel_size
         )
-
-        # 设置输出形状与 v 相同
-        # 使用 set_type 显式设置类型以确保 shape 信息被保留
         output.setType(v.type())
+        print(dir(output))
+        print(output.type)
         return output
 
     @staticmethod
@@ -124,56 +122,29 @@ class GatedDeltaRuleOp(torch.autograd.Function):
 
         return output
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        """
-        反向传播
-        """
-        q, k, v, a, b = ctx.saved_tensors
-        head_dim = ctx.head_dim
-        conv_kernel_size = ctx.conv_kernel_size
-
-        # 简化实现：返回梯度
-        grad_q = grad_k = grad_v = grad_a = grad_b = None
-
-        if ctx.needs_input_grad[0]:
-            grad_q = torch.zeros_like(q)
-        if ctx.needs_input_grad[1]:
-            grad_k = torch.zeros_like(k)
-        if ctx.needs_input_grad[2]:
-            grad_v = torch.zeros_like(v)
-        if ctx.needs_input_grad[3]:
-            grad_a = torch.zeros_like(a)
-        if ctx.needs_input_grad[4]:
-            grad_b = torch.zeros_like(b)
-
-        return grad_q, grad_k, grad_v, grad_a, grad_b, None, None
-
 
 # 注册 ONNX 符号处理（在 symbolic 方法中已完成，这里作为备选）
 def _register_onnx_ops():
     """注册 GatedDeltaRuleOp 的 ONNX 符号处理"""
-    try:
-        from torch.onnx import register_custom_op_symbolic
+    from torch.onnx import register_custom_op_symbolic
 
-        def symbolic_gated_delta_rule(g, q, k, v, a, b, head_dim, conv_kernel_size):
-            """GatedDeltaRuleOp 的 ONNX 符号处理"""
-            output = g.op(
-                'custom::GatedDeltaRule',
-                q, k, v, a, b,
-                head_dim_i=head_dim,
-                conv_kernel_size_i=conv_kernel_size
-            )
-            # 使用 Identity 帮助形状推断
-            return g.op('Identity', output)
-
-        register_custom_op_symbolic(
-            'custom::gated_delta_rule_op',
-            symbolic_gated_delta_rule,
-            opset_version=14
+    def symbolic_gated_delta_rule(g, q, k, v, a, b, head_dim, conv_kernel_size):
+        """GatedDeltaRuleOp 的 ONNX 符号处理"""
+        output = g.op(
+            'custom::GatedDeltaRule',
+            q, k, v, a, b,
+            head_dim_i=head_dim,
+            conv_kernel_size_i=conv_kernel_size
         )
-    except Exception:
-        pass
+        # 使用 Identity 帮助形状推断
+        return g.op('Identity', output)
+
+    register_custom_op_symbolic(
+        'custom::gated_delta_rule_op',
+        symbolic_gated_delta_rule,
+        opset_version=14
+    )
+
 
 _register_onnx_ops()
 
@@ -184,6 +155,7 @@ class GatedDeltaRuleModule(nn.Module):
 
     用于ONNX导出
     """
+
     def __init__(self, head_dim: int, conv_kernel_size: int):
         super().__init__()
         self.head_dim = head_dim
@@ -347,7 +319,7 @@ class GatedDeltaNet(nn.Module):
         # ===== GatedDeltaRule 计算 =====
         attn_output = self.gated_delta_rule_module(q, k, v, a, b)
 
-        # ===== 归一化 =====
+        # ===== 归一化, 应用z门控 =====
         attn_output = self.norm(attn_output, z)
 
         # ===== 输出投影 =====
@@ -444,10 +416,6 @@ class GatedAttention(nn.Module):
             q_gate, k, v = qkv.split([self.q_output_size, self.kv_size, self.kv_size], dim=-1)
             # 分割gate
             q, gate = q_gate.chunk(2, dim=-1)
-            print(f"gate: {gate.shape}")
-            print(f"q: {gate.shape}")
-            print(f"k: {gate.shape}")
-            print(f"v: {gate.shape}")
         else:
             q, k, v = qkv.split([self.q_output_size, self.kv_size, self.kv_size], dim=-1)
             gate = None
