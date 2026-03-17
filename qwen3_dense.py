@@ -28,24 +28,51 @@ max_seq_len = 1024
 
 
 class SwiGLU(nn.Module):
-    """SwiGLU激活函数 (SiLU/Swish + GLU)"""
+    """SwiGLU激活函数 (SiLU/Swish + GLU)
+    结构:
+        输入 (hidden_size)
+        ├─→ gate_proj ──→ SiLU激活
+        │                  ├─→ 点乘
+        │                  ↓
+        ├─→ up_proj ──────→
+        │
+        └─→ down_proj ←─ 输出 (hidden_size)
+
+    公式: output = down_proj(SiLU(gate_proj(x)) ⊙ up_proj(x))
+
+    优点:
+        - 比GELU/ReLU更平滑的激活梯度
+        - GLU结构提供自适应的信息通道（类似注意力机制）
+        - 在大语言模型中表现优异
+    """
 
     def __init__(self, hidden_size: int, intermediate_size: int):
         super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        # 上投影: hidden_size → intermediate_size
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        # 门控投影: hidden_size → intermediate_size (用于调制上投影)
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        # 下投影: intermediate_size → hidden_size (恢复维度)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: [batch_size, seq_len, hidden_size]
+            x: 输入张量 [batch_size, seq_len, hidden_size]
         Returns:
-            output: [batch_size, seq_len, hidden_size]
-        """
-        # SwiGLU: gate * silu(up)
+            output: 输出张量 [batch_size, seq_len, hidden_size]
 
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        计算流程:
+            1. up_x = up_proj(x)          # [batch_size, seq_len, intermediate_size]
+            2. gate_x = gate_proj(x)      # [batch_size, seq_len, intermediate_size]
+            3. gated = SiLU(gate_x)       # 应用Swish激活
+            4. combined = gated ⊙ up_x   # 元素级点乘 (门控)
+            5. output = down_proj(combined) # [batch_size, seq_len, hidden_size]
+        """
+        up_x = self.up_proj(x)
+        gate_x = F.silu(self.gate_proj(x))
+        return self.down_proj(gate_x * up_x)
+
 
 
 class Qwen3Attention(nn.Module):

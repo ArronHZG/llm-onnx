@@ -28,6 +28,7 @@ seq_len = 10
 max_seq_len = 1024
 
 # 简化模型结构
+TrueSwiGLU = SwiGLU
 SwiGLU = FeedForward
 
 
@@ -109,7 +110,7 @@ class Qwen3SimpleMoE(nn.Module):
         ])
 
         # 共享专家 (所有 token 都会经过)
-        self.shared_expert = SwiGLU(hidden_size, intermediate_size)
+        self.shared_expert = TrueSwiGLU(hidden_size, intermediate_size)
 
     def forward(self, hidden_states):
         """
