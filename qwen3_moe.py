@@ -12,6 +12,7 @@ Qwen3 MoE (Mixture of Experts) 模型实现
 - TopK专家路由: 每个token选择top-k个专家
 """
 import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -103,7 +104,6 @@ class Qwen3SimpleMoE(nn.Module):
         # 专家网络 (每个专家是一个 SwiGLU MLP)
         # SwiGLU: gate_proj + up_proj -> SiLU(gate) * up -> down_proj
         self.experts = nn.ModuleList([
-            # 简化模型结构
             SwiGLU(hidden_size, intermediate_size)
             for _ in range(num_experts)
         ])
@@ -122,6 +122,7 @@ class Qwen3SimpleMoE(nn.Module):
         original_shape = hidden_states.shape
         batch_size, seq_len, hidden_dim = original_shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        num_tokens = hidden_states.shape[0]
 
         # ===== 1. 路由计算 (使用 TopKGate) =====
         top_k_gates, top_k_indices = self.gate(hidden_states)
@@ -129,26 +130,49 @@ class Qwen3SimpleMoE(nn.Module):
         # ===== 2. 共享专家计算 =====
         shared_output = self.shared_expert(hidden_states)
 
-        # ===== 3. 专家计算 =====
+        # ===== 3. 专家计算 (按专家分组批量处理) =====
+        # 展平: 每个token的每个top-k选择变成一个条目
+        # top_k_indices: (num_tokens, top_k) -> flat_idx: (num_tokens * top_k,)
+        flat_idx = top_k_indices.view(-1)
+        # top_k_gates: (num_tokens, top_k) -> flat_weights: (num_tokens * top_k,)
+        flat_weights = top_k_gates.view(-1)
+
         # 初始化输出
         final_hidden_states = torch.zeros_like(hidden_states)
 
-        # 遍历每个专家
-        for i, expert in enumerate(self.experts):
-            # 找出需要该专家的 token
-            mask = (top_k_indices == i)  # (num_tokens, top_k)
-            # 把 (num_tokens, top_k) 转为 (num_tokens,) 的任一匹配
-            mask = mask.any(dim=-1)
+        # 按专家索引排序，将同一专家的token连续存放
+        sorted_idx = flat_idx.argsort()
 
-            if mask.any():
-                # 获取该专家处理的 token
-                tokens_for_expert = hidden_states[mask]
-                # 专家前向传播
-                expert_output = expert(tokens_for_expert)
-                # 获取对应的权重 (该专家被选中的所有 token 的权重之和)
-                weights = top_k_gates[mask].sum(dim=-1, keepdim=True)
-                # 累加结果
-                final_hidden_states[mask] += expert_output * weights
+        # 统计每个专家的token数量（bincount会自动为未激活的专家返回0）
+        expert_counts = flat_idx.bincount(minlength=self.num_experts)
+
+        # 计算每个专家的起始位置（前缀和）
+        expert_offsets = torch.zeros(self.num_experts, dtype=torch.long, device=flat_idx.device)
+        expert_offsets[1:] = expert_counts[:-1].cumsum(0)
+
+        # 按专家分组批量处理
+        for expert_id in range(self.num_experts):
+            start = expert_offsets[expert_id].item()
+            count = expert_counts[expert_id].item()
+
+            if count == 0:
+                continue
+
+            # 获取该专家负责的token在排序后的位置
+            sorted_positions = sorted_idx[start:start + count]
+            # 获取对应的原始token索引
+            token_indices = sorted_positions // self.top_k
+
+            # 获取对应的权重
+            weights = flat_weights[sorted_positions]
+
+            # 批量计算
+            expert_tokens = hidden_states[token_indices]
+            expert_output = self.experts[expert_id](expert_tokens)
+
+            # 加权累加到对应位置
+            weighted_output = expert_output * weights.unsqueeze(-1)
+            final_hidden_states.index_add_(0, token_indices, weighted_output)
 
         # ===== 4. 合并共享专家输出 =====
         final_hidden_states = final_hidden_states + shared_output
@@ -456,7 +480,7 @@ if __name__ == "__main__":
         num_attention_heads=12,
         num_key_value_heads=2,  # GQA: 12个Q头，2个KV头
         num_hidden_layers=1,
-        num_experts=2,  # 8个专家
+        num_experts=8,  # 8个专家
         top_k=2,  # 激活2个专家
         intermediate_size=2048,
         max_position_embeddings=max_seq_len,
