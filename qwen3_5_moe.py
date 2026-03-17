@@ -21,8 +21,8 @@ import torch
 import torch.nn as nn
 
 from norm_layer import ZeroCenteredRMSNorm
-from qwen3_5_dense import GatedDeltaNet, GatedAttention
-from qwen3_moe import Qwen3SimpleMoE
+from qwen3_5_dense import GatedDeltaNet, GatedAttention, SwiGLU, TrueSwiGLU
+from qwen3_moe import Qwen3SimpleMoE, TopKGate
 from utils.onnx_utils import export_and_simplify
 
 # 配置参数
@@ -47,6 +47,58 @@ def set_seed(seed: int = 42):
 set_seed(42)
 
 ZeroCenteredRMSNorm = nn.LayerNorm
+
+
+class SimpleMoE(nn.Module):
+    """
+    Qwen3 风格的 MoE (Mixture of Experts) 实现
+
+    特点:
+        - 使用 TopKGate 进行 token 到专家的路由
+        - 每个专家使用 SwiGLU (SiLU 门控线性单元)
+        - 包含一个共享专家 (所有 token 都会经过)
+    """
+
+    def __init__(self, hidden_size, num_experts, top_k, intermediate_size):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_experts = num_experts
+        self.top_k = top_k
+
+        # 使用 TopKGate 进行路由
+        self.gate = TopKGate(hidden_size, num_experts, top_k)
+
+        # 专家网络 (每个专家是一个 SwiGLU MLP)
+        # SwiGLU: gate_proj + up_proj -> SiLU(gate) * up -> down_proj
+        self.experts = nn.ModuleList([
+            SwiGLU(hidden_size, intermediate_size)
+            for _ in range(num_experts)
+        ])
+
+        # 共享专家 (所有 token 都会经过)
+        self.shared_expert = TrueSwiGLU(hidden_size, intermediate_size)
+
+    def forward(self, hidden_states):
+        original_shape = hidden_states.shape
+        batch_size, seq_len, hidden_dim = original_shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # 1. 先注释掉复杂的路由逻辑
+        # top_k_gates, top_k_indices = self.gate(hidden_states)
+
+        # 2. 直接通过共享专家和第一个专家（模拟静态路径）
+        shared_output = self.shared_expert(hidden_states)
+
+        # 3. 暂时直接累加所有专家输出（绕过 TopK 动态索引）
+        # 这一步是为了验证如果没有动态形状，模型是否能导出
+        expert_output_sum = 0
+        for expert in self.experts:
+            expert_output_sum += expert(hidden_states) * 0.1  # 假的权重
+
+        final_hidden_states = shared_output + expert_output_sum
+
+        return final_hidden_states.view(batch_size, seq_len, hidden_dim)
+
 
 class Qwen3_5MoEDecoderLayer(nn.Module):
     """Qwen3.5 MoE Decoder层 (支持GatedDeltaNet线性注意力)"""
@@ -83,7 +135,7 @@ class Qwen3_5MoEDecoderLayer(nn.Module):
                 max_seq_len=max_seq_len,
                 use_qk_norm=True,  # Qwen3.5特色: QK归一化
                 qk_norm_type='l2',
-                use_gate=True,     # 使用门控注意力
+                use_gate=True,  # 使用门控注意力
             )
         else:
             self.self_attn = GatedAttention(

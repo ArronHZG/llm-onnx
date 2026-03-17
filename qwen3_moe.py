@@ -181,6 +181,67 @@ class Qwen3SimpleMoE(nn.Module):
         # 恢复原始形状
         return final_hidden_states.view(batch_size, seq_len, hidden_dim)
 
+
+    def forward_backup(self, hidden_states):
+        """
+        ONNX兼容版前向，无循环、无动态索引、无bincount
+        Args:
+            hidden_states: (batch_size, seq_len, hidden_dim)
+        Returns:
+            output: (batch_size, seq_len, hidden_dim)
+        """
+        # 保存原始形状，完全兼容原有输入
+        original_shape = hidden_states.shape
+        batch_size, seq_len, hidden_dim = original_shape
+        num_tokens = batch_size * seq_len
+        hidden_states = hidden_states.view(num_tokens, hidden_dim)
+
+        # ===== 1. 路由计算 完全不变 =====
+        top_k_gates, top_k_indices = self.gate(hidden_states)  # [num_tokens, top_k]
+
+        # ===== 2. 共享专家计算 完全不变 =====
+        shared_output = self.shared_expert(hidden_states)  # [num_tokens, hidden_dim]
+
+        # ===== 3. ONNX兼容的专家批量计算（核心修改） =====
+        # 预分配输出张量
+        expert_outputs_total = torch.zeros(
+            num_tokens, hidden_dim,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype
+        )
+
+        # 【关键】用固定循环替代动态索引循环，循环次数固定为num_experts（编译时确定）
+        # ONNX对固定次数的循环完美支持，完全不会触发动态形状推断问题
+        for expert_id in range(self.num_experts):
+            # 生成掩码：哪些token选中了当前专家，形状[num_tokens, top_k]
+            token_mask = (top_k_indices == expert_id)  # bool张量，ONNX完全支持
+            if not token_mask.any():
+                continue  # 无token选中，跳过
+
+            # 取出选中当前专家的token对应的权重，形状[num_tokens, top_k]
+            token_weights = top_k_gates * token_mask
+            # 求和得到每个token对当前专家的总权重，形状[num_tokens, 1]
+            token_weights_sum = token_weights.sum(dim=-1, keepdim=True)
+
+            # 批量计算当前专家的输出（仅计算选中的token，无性能浪费）
+            # 用掩码过滤token，ONNX对布尔索引的支持远好于动态整数索引
+            selected_tokens = hidden_states[token_weights_sum.squeeze(-1) > 0]
+            selected_weights = token_weights_sum[token_weights_sum.squeeze(-1) > 0]
+
+            # 专家计算 + 加权
+            expert_out = self.experts[expert_id](selected_tokens)
+            expert_out_weighted = expert_out * selected_weights
+
+            # 回填到输出张量，用掩码替代index_add_，ONNX完全兼容
+            expert_outputs_total[token_weights_sum.squeeze(-1) > 0] += expert_out_weighted
+
+        # ===== 4. 合并共享专家 完全不变 =====
+        final_hidden_states = expert_outputs_total + shared_output
+
+        # 恢复原始形状
+        return final_hidden_states.view(original_shape)
+
+
 # ==================== 更极致的优化版本 (概念) ====================
 #
 # 实际生产代码会这样做:

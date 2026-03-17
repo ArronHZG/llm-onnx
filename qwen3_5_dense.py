@@ -172,6 +172,7 @@ def _register_onnx_ops():
                 conv_kernel_size_i=conv_kernel_size
             )
             # 使用 Identity 帮助形状推断
+            output.setType(q.type().with_sizes(q.sizes()))
             return g.op('Identity', output)
 
         register_custom_op_symbolic(
