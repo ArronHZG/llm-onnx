@@ -61,6 +61,7 @@ llm-onnx/
 ![Qwen3.5 Dense](image/qwen3_5_dense_sim.png)
 **Qwen3.5 Dense**：包含零中心化RMSNorm、门控注意力机制。
 
+
 ### 位置编码可视化
 
 ![RoPE Visualization](image/rope_visualization.png)
@@ -121,6 +122,24 @@ python -m visualization.positional_encoding_visualization
 
 - `rope_visualization.png` - RoPE可视化
 - `positional_encoding_visualization.png` - 位置编码可视化
+
+
+## 仓库
+
+参考：
+
+> 
+> https://github.com/rasbt/LLMs-from-scratch
+>
+> https://github.com/jingyaogong/minimind
+> 
+> https://github.com/sgl-project/sglang
+> 
+> https://github.com/NVlabs/GatedDeltaNet
+> 
+> https://github.com/fla-org/flash-linear-attention
+
+> https://github.com/sustcsonglin/linear-attention-and-beyond-slides
 
 ## License
 

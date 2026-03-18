@@ -64,8 +64,13 @@ class GatedRMSNorm(nn.Module):
         """
         # 计算RMS
         rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+        print(f"rms: {rms.shape}")
+
         # 归一化并乘以权重
         x = x * rms * (1.0 + self.weight)
+
+        print(f"x: {x.shape}")
 
         # 如果提供了门控z，应用门控
         if z is not None:
