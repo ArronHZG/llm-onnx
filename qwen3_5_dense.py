@@ -41,21 +41,19 @@ class GatedDeltaRuleOp(torch.autograd.Function):
     """
     基于DeltaNet优化后的GatedDeltaRule算子
 
-    关键优化:
-    - 支持QK归一化 (l2或sum)
-    - 支持beta参数控制状态追踪
-    - 高效的Delta规则实现 (chunk模式)
-    - 正确的梯度传播
+    参考 sglang 实现:
+    - fused_gdn_gating: Mamba-style gate 计算
+    - chunk_gated_delta_rule: 高效的chunk模式计算
     """
 
     @staticmethod
-    def symbolic(g, q, k, v, a, b, head_dim, conv_kernel_size):
+    def symbolic(g, q, k, v, a, b, A_log, dt_bias, head_dim, conv_kernel_size):
         """
         ONNX 符号定义
         """
         output = g.op(
             'custom::GatedDeltaRule',
-            q, k, v, a, b,
+            q, k, v, a, b, A_log, dt_bias,
             head_dim_i=head_dim,
             conv_kernel_size_i=conv_kernel_size,
         )
@@ -63,153 +61,128 @@ class GatedDeltaRuleOp(torch.autograd.Function):
         return output
 
     @staticmethod
-    def forward(ctx, q, k, v, a, b, head_dim, conv_kernel_size):
+    def forward(ctx, q, k, v, a, b, A_log, dt_bias, head_dim, conv_kernel_size):
         """
-        优化后的forward实现 - 使用chunk模式
+        GatedDeltaRule forward 实现
 
-        Args:
-            q: [batch, seq_len, num_kv_heads , head_dim]
-            k: [batch, seq_len, num_kv_heads , head_dim]
-            v: [batch, seq_len, num_kv_heads , head_dim]
-            a: [batch, seq_len, num_kv_heads]  # 状态A (用于门控)
-            b: [batch, seq_len, num_kv_heads]  # 状态B (用于门控)
-            head_dim: int
-            conv_kernel_size: int
+        参考 sglang: fused_gdn_gating
+
+        输入形状 (head_first=False):
+            q: [batch, seq_len, num_heads, head_dim]
+            k: [batch, seq_len, num_heads, head_dim]
+            v: [batch, seq_len, num_heads, head_dim]
+            a: [batch, seq_len, num_heads]  # 门控输入
+            b: [batch, seq_len, num_heads]  # beta 输入
+            A_log: [num_heads]  # 状态转移矩阵对数
+            dt_bias: [num_heads]  # 动态时间步长偏置
+
+        输出形状:
+            output: [batch, seq_len, num_heads, head_dim]
         """
         batch, seq_len, num_heads, head_dim = q.shape
-        # a 是 [batch, seq_len, num_heads] 形状
-        # num_heads = a.shape[-1]
 
-        # Reshape to heads
-        # q_heads = q.view(batch, seq_len, num_heads, head_dim)
-        # k_heads = k.view(batch, seq_len, num_heads, head_dim)
-        # v_heads = v.view(batch, seq_len, num_heads, head_dim)
-        a_heads = a.view(batch, seq_len, num_heads, 1)  # [B, S, H, 1]
-        b_heads = b.view(batch, seq_len, num_heads, 1)  # [B, S, H, 1]
+        # ===== QK L2 归一化 =====
+        q = F.normalize(q, p=2, dim=-1)
+        k = F.normalize(k, p=2, dim=-1)
 
-        q_heads = q
-        k_heads = k
-        v_heads = v
-        # a_heads = a
-        # b_heads = b
+        # ===== Mamba-style gate 计算 (参考 fused_gdn_gating) =====
+        # g = -A_log.exp() * softplus(a + dt_bias)
+        # beta = sigmoid(b)
+        a_expanded = a.unsqueeze(-1)  # [B, S, H, 1]
+        A_expanded = A_log.view(1, 1, num_heads, 1)  # [1, 1, H, 1]
+        dt_bias_expanded = dt_bias.view(1, 1, num_heads, 1)  # [1, 1, H, 1]
 
-        # ===== QK归一化 (与DeltaNet一致) =====
-        q_heads = F.normalize(q_heads, p=2, dim=-1)
-        k_heads = F.normalize(k_heads, p=2, dim=-1)
+        # softplus(a + dt_bias)
+        x = a_expanded + dt_bias_expanded
+        softplus_x = F.softplus(x)
 
-        # ===== 高效的Delta规则计算 - 使用chunk模式 =====
-        # 参考 GatedDeltaNet 的实现，使用状态累积
-        output = torch.zeros_like(v_heads)
+        # g = -A_exp * softplus(a + dt_bias)
+        g = -A_expanded.exp() * softplus_x  # [B, S, H, 1]
+        g = g.squeeze(-1)  # [B, S, H]
+
+        # beta = sigmoid(b)
+        beta = torch.sigmoid(b)  # [B, S, H]
+
+        # ===== GatedDeltaRule 计算 =====
         scale = 1.0 / (head_dim ** 0.5)
+        output = torch.zeros_like(v)
 
-        # 初始化状态
-        # S: [batch, num_heads, head_dim, head_dim] 状态矩阵
-        S = torch.zeros(batch, num_heads, head_dim, head_dim, dtype=q_heads.dtype, device=q_heads.device)
-
-        # 使用卷积窗口大小作为chunk
-        chunk_size = min(conv_kernel_size, seq_len)
+        # 初始化状态 S: [batch, num_heads, head_dim, head_dim]
+        S = torch.zeros(batch, num_heads, head_dim, head_dim, dtype=q.dtype, device=q.device)
 
         for i in range(seq_len):
-            q_i = q_heads[:, i, :, :]  # [batch, num_heads, head_dim]
-            k_i = k_heads[:, i, :, :]  # [batch, num_heads, head_dim]
-            v_i = v_heads[:, i, :, :]  # [batch, num_heads, head_dim]
+            q_i = q[:, i, :, :]      # [B, H, D]
+            k_i = k[:, i, :, :]      # [B, H, D]
+            v_i = v[:, i, :, :]      # [B, H, D]
+            g_i = g[:, i, :]          # [B, H]
+            beta_i = beta[:, i, :]    # [B, H]
 
-            # 门控计算: a * b -> sigmoid
-            if i < seq_len:
-                a_i = a_heads[:, i, :, :]  # [batch, num_heads, 1]
-                b_i = b_heads[:, i, :, :]  # [batch, num_heads, 1]
-                gate = torch.sigmoid(a_i * b_i)  # [batch, num_heads, 1]
-            else:
-                gate = torch.ones_like(a_i)
+            # 扩展维度用于状态计算
+            g_i = g_i.unsqueeze(-1).unsqueeze(-1)  # [B, H, 1, 1]
+            beta_i = beta_i.unsqueeze(-1)           # [B, H, 1]
 
             # 状态更新: S = g * S + k * v
-            # gate: [B, H, 1] -> 需要扩展到 [B, H, D, D]
-            # 注意: a_i 已经是 [B, H, 1]，只需要一次 unsqueeze
-            gate_expanded = gate.unsqueeze(-1)  # [B, H, 1, D] - 广播到 [B, H, D, D]
             kv_term = k_i.unsqueeze(-1) * v_i.unsqueeze(-2)  # [B, H, D, D]
-            S = gate_expanded * S + kv_term
+            S = g_i * S + kv_term
 
-            # 输出: o = q @ S
-            # q_i: [B, H, D], S: [B, H, D, D] -> [B, H, D]
-            o_i = torch.einsum('bhd,bhdm->bhm', q_i, S) * scale
+            # 输出: o = beta * (q @ S) * scale
+            o_i = torch.einsum('bhd,bhdm->bhm', q_i, S)  # [B, H, D]
+            o_i = o_i * beta_i * scale
 
             output[:, i, :, :] = o_i
 
-        output = output.view(batch, seq_len, -1)
-
-        # 保存用于backward
-        ctx.save_for_backward(q, k, v, a, b)
+        # 保存用于 backward
+        ctx.save_for_backward(q, k, v, g, beta, A_log, dt_bias)
         ctx.head_dim = head_dim
         ctx.conv_kernel_size = conv_kernel_size
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        """
-        正确的backward实现 - 近似梯度
-
-        注意: 这是一个简化的梯度实现，为了效率使用梯度归一化
-        完整的梯度计算需要更复杂的实现
-        """
-        q, k, v, a, b = ctx.saved_tensors
+        """简化的梯度实现"""
+        q, k, v, g, beta, A_log, dt_bias = ctx.saved_tensors
         head_dim = ctx.head_dim
-        conv_kernel_size = ctx.conv_kernel_size
 
-        batch, seq_len, _ = q.shape
-        num_heads = a.shape[-1]  # 使用 a 的维度
-
-        # Reshape to heads
-        q_heads = q.view(batch, seq_len, num_heads, head_dim)
-        k_heads = k.view(batch, seq_len, num_heads, head_dim)
-        v_heads = v.view(batch, seq_len, num_heads, head_dim)
-        a_heads = a.view(batch, seq_len, num_heads, 1)
-        b_heads = b.view(batch, seq_len, num_heads, 1)
-        grad_output_heads = grad_output.view(batch, seq_len, num_heads, head_dim)
-
+        batch, seq_len, num_heads, _ = q.shape
         scale = 1.0 / (head_dim ** 0.5)
 
         # 初始化梯度
-        grad_q = torch.zeros_like(q_heads)
-        grad_k = torch.zeros_like(k_heads)
-        grad_v = torch.zeros_like(v_heads)
-        grad_a = torch.zeros_like(a_heads)
-        grad_b = torch.zeros_like(b_heads)
+        grad_q = torch.zeros_like(q)
+        grad_k = torch.zeros_like(k)
+        grad_v = torch.zeros_like(v)
+        grad_a = torch.zeros_like(grad_output)
+        grad_b = torch.zeros_like(grad_output)
+        grad_A_log = torch.zeros_like(A_log)
+        grad_dt_bias = torch.zeros_like(dt_bias)
 
-        # 反向计算梯度 (简化版本)
+        # 反向计算
         S = torch.zeros(batch, num_heads, head_dim, head_dim, dtype=q.dtype, device=q.device)
 
         for i in range(seq_len - 1, -1, -1):
-            q_i = q_heads[:, i, :, :]
-            k_i = k_heads[:, i, :, :]
-            v_i = v_heads[:, i, :, :]
-            a_i = a_heads[:, i, :, :]
-            b_i = b_heads[:, i, :, :]
-            do_i = grad_output_heads[:, i, :, :]
+            q_i = q[:, i, :, :]
+            k_i = k[:, i, :, :]
+            v_i = v[:, i, :, :]
+            g_i = g[:, i, :].unsqueeze(-1).unsqueeze(-1)  # [B, H] -> [B, H, 1, 1]
+            beta_i = beta[:, i, :].unsqueeze(-1)  # [B, H] -> [B, H, 1]
+            do_i = grad_output[:, i, :, :]
 
-            gate = torch.sigmoid(a_i * b_i)
+            # 状态更新
             kv_term = k_i.unsqueeze(-1) * v_i.unsqueeze(-2)
-            S = gate * S + kv_term
+            S = g_i * S + kv_term
 
-            # grad_q = do @ S^T * scale
-            grad_q[:, i, :, :] = torch.einsum('bhd,bhdm->bhm', do_i * scale, S.transpose(-2, -1))
+            # 梯度计算
+            grad_q[:, i, :, :] = torch.einsum('bhd,bhdm->bhm', do_i * beta_i * scale, S.transpose(-2, -1))
+            # 简化 grad_v: grad_v = do * beta * scale * q (忽略 S)
+            grad_v[:, i, :, :] = do_i * beta_i * scale * q_i
 
-            # grad_v approx
-            grad_v[:, i, :, :] = torch.einsum('bhd,bhd->bhd', do_i * scale, q_i @ S)
+        # 简化的 a, b 梯度 (使用 grad_output 的统计信息)
+        # a, b 的形状是 [B, S, H]，所以 grad_a, grad_b 也应该是 [B, S, H]
+        grad_a = grad_output.sum(dim=3) * 0.01  # [B, S, H, D] -> [B, S, H]
+        grad_b = grad_output.sum(dim=3) * 0.01  # [B, S, H, D] -> [B, S, H]
 
-            # grad_k approx
-            grad_k[:, i, :, :] = torch.einsum('bhd,bhd->bhd', do_i * scale, v_i @ S.transpose(-2, -1))
+        # 注意: grad_q, grad_k, grad_v 已经是 [B, S, H, D] 形状，不需要 reshape
 
-            # grad_a, grad_b simplified
-            grad_a[:, i, :, :] = do_i.abs().mean(-1, keepdim=True) * 0.01
-            grad_b[:, i, :, :] = do_i.abs().mean(-1, keepdim=True) * 0.01
-
-        grad_q = grad_q.view(batch, seq_len, -1)
-        grad_k = grad_k.view(batch, seq_len, -1)
-        grad_v = grad_v.view(batch, seq_len, -1)
-        grad_a = grad_a.view(batch, seq_len, -1)
-        grad_b = grad_b.view(batch, seq_len, -1)
-
-        return grad_q, grad_k, grad_v, grad_a, grad_b, None, None, None, None
+        return grad_q, grad_k, grad_v, grad_a, grad_b, grad_A_log, grad_dt_bias, None, None
 
 
 # 注册 ONNX 符号处理（在 symbolic 方法中已完成，这里作为备选）
@@ -244,35 +217,62 @@ _register_onnx_ops()
 
 class GatedDeltaRuleModule(nn.Module):
     """
-    GatedDeltaRule的模块化包装
+    GatedDeltaRule 的模块化包装
 
-    用于ONNX导出
-    支持QK归一化选项
+    用于 ONNX 导出
+    参考 sglang: fused_gdn_gating + chunk_gated_delta_rule
     """
 
-    def __init__(self, head_dim: int, conv_kernel_size: int):
+    def __init__(self, head_dim: int, conv_kernel_size: int, num_heads: int):
         super().__init__()
         self.head_dim = head_dim
         self.conv_kernel_size = conv_kernel_size
+        self.num_heads = num_heads
         self._export_op_name = 'sglang::GatedDeltaRule'
+
+        # ===== Mamba-style gate 参数 =====
+        # A_log: 状态转移矩阵对数 [num_heads]
+        # dt_bias: 动态时间步长偏置 [num_heads]
+        A = torch.empty(self.num_heads, dtype=torch.float32).uniform_(0, 16)
+        A_log = torch.log(A)
+        self.A_log = nn.Parameter(A_log)
+        self.A_log._no_weight_decay = True
+        self.D = nn.Parameter(torch.ones(self.num_heads))
+        self.D._no_weight_decay = True
+        dt_min = 0.001
+        dt_max = 0.1
+        dt_init_floor = 1e-4
+        dt = torch.exp(
+            torch.rand(self.num_heads) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        )
+        dt = torch.clamp(dt, min=dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        self.dt_bias = nn.Parameter(inv_dt)
+        self.dt_bias._no_weight_decay = True
+
+        # self.A_log = nn.Parameter(torch.zeros(num_heads))
+        # self.dt_bias = nn.Parameter(torch.zeros(num_heads))
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         """
-        执行GatedDeltaRule计算（不应用z门控）
+        执行 GatedDeltaRule 计算
 
         Args:
-            q: [batch, seq_len, num_heads * head_dim]
-            k: [batch, seq_len, num_heads * head_dim] (after GQA)
-            v: [batch, seq_len, num_heads * head_dim] (after GQA)
+            q: [batch, seq_len, num_heads, head_dim]
+            k: [batch, seq_len, num_heads, head_dim]
+            v: [batch, seq_len, num_heads, head_dim]
             a: [batch, seq_len, num_heads] - gate
             b: [batch, seq_len, num_heads] - beta
+            A_log: [num_heads] - Mamba-style A_log 参数
+            dt_bias: [num_heads] - Mamba-style dt_bias 参数
 
         Returns:
-            output: [batch, seq_len, num_heads * head_dim]
+            output: [batch, seq_len, num_heads, head_dim]
         """
         return GatedDeltaRuleOp.apply(
-            q, k, v, a, b,
+            q, k, v, a, b, self.A_log, self.dt_bias,
             self.head_dim, self.conv_kernel_size
         )
 
@@ -371,28 +371,9 @@ class GatedDeltaNet(nn.Module):
             bias=False
         )
 
-        # ===== Mamba-style 状态参数 =====
-        if use_mamba_gate:
-            # A_log: 状态转移矩阵的对数 (可学习参数)
-            A = torch.empty(num_heads, dtype=torch.float32).uniform_(0, 16)
-            A_log = torch.log(A)
-            self.A_log = nn.Parameter(A_log)
-            self.A_log._no_weight_decay = True
-            # dt_bias: 动态时间步长的偏置
-            dt_min, dt_max = 0.001, 0.1
-            dt_init_floor = 1e-4
-            dt = torch.exp(
-                torch.rand(num_heads) * (math.log(dt_max) - math.log(dt_min))
-                + math.log(dt_min)
-            )
-            dt = torch.clamp(dt, min=dt_init_floor)
-            inv_dt = dt + torch.log(-torch.expm1(-dt))
-            self.dt_bias = nn.Parameter(inv_dt)
-            self.dt_bias._no_weight_decay = True
-
         # ===== GatedDeltaRule ONNX算子 =====
         self.gated_delta_rule_module = GatedDeltaRuleModule(
-            head_dim, conv_kernel_size,
+            head_dim, conv_kernel_size, num_heads,
         )
 
         # ===== 注意力输出归一化 =====
@@ -434,14 +415,6 @@ class GatedDeltaNet(nn.Module):
         z = self.z_proj(x)
         a = self.a_proj(x)
         b = self.b_proj(x)
-
-        # ===== Mamba-style gate 计算 =====
-        # if self.use_mamba_gate:
-        #     # a = -A_exp * softplus(a + dt_bias)
-        #     a = -self.A_log.float().exp() * F.softplus(a + self.dt_bias)
-        # else:
-        #     # 简化的门控
-        #     a = F.logsigmoid(a) / 16.0  # gate_logit_normalizer = 16
 
         # ===== ShortConvolution (因果卷积) =====
         # 需要将 [B, S, H] -> [B, H, S] 进行卷积
@@ -496,6 +469,7 @@ class GatedDeltaNet(nn.Module):
 
         # ===== GatedDeltaRule 计算 =====
         # a 和 b 已经是 [B, S, num_heads] 形状，不需要 transpose
+        # A_log 和 dt_bias 是 Mamba-style 门控参数
         attn_output = self.gated_delta_rule_module(q, k, v, a, b)
 
         # ===== Reshape 输出 (flatten 到 num_heads * head_dim) =====
