@@ -123,7 +123,6 @@ class Qwen3SimpleMoE(nn.Module):
         original_shape = hidden_states.shape
         batch_size, seq_len, hidden_dim = original_shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        num_tokens = hidden_states.shape[0]
 
         # ===== 1. 路由计算 (使用 TopKGate) =====
         top_k_gates, top_k_indices = self.gate(hidden_states)

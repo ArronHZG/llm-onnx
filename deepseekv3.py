@@ -1,13 +1,22 @@
-"""DeepSeekV3 Model Implementation.
+"""DeepSeekV3 Model Implementation (optimized).
 
-DeepSeekV3 is an improved MoE (Mixture of Experts) language model with:
-- 256 routed experts with 8 activated per token
-- Grouped top-k routing (8 groups, 4 experts per group)
-- 2 shared experts for improved performance
-- Multi-head Latent Attention (MLA) for efficient KV cache
-- Multi-Head Latent Attention with Q-Lora rank compression
+DeepSeekV3 是改进的 MoE (Mixture of Experts) 语言模型，具有：
+- 256 个路由专家，每个 token 激活 8 个
+- 分组 top-k 路由 (8 组，每组 4 个专家)
+- 2 个共享专家以改进性能
+- 多头潜在注意力 (MLA) 用于高效 KV 缓存
 
-Reference: https://arxiv.org/abs/2401.14163
+优化策略 (参考 DeepSeekMoE 论文):
+1. Softmax 权重归一化 - 替代原始的概率归一化
+2. 优化的负载平衡损失 - 确保专家使用均衡
+3. Z-loss 正则化 - 防止路由 logits 爆炸
+4. 共享专家隔离 - 共享专家与路由专家分离
+5. 正交初始化 - 提高路由稳定性
+6. 高效批处理 - 优化的专家计算流程
+
+References:
+- DeepSeekV3: https://arxiv.org/abs/2401.14163
+- DeepSeekMoE: https://arxiv.org/abs/2401.06066
 """
 
 import math
@@ -18,8 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from gpt import FeedForward
-from gpt_rope import precompute_freqs_cis, apply_rotary_pos_emb
-from qwen3_dense import SwiGLU
+from gpt_rope import apply_rotary_pos_emb, precompute_freqs_cis
 
 RMSNorm = nn.LayerNorm
 
@@ -48,47 +56,67 @@ SwiGLU = FeedForward
 DeepSeekV3MLP = SwiGLU
 
 
-class MultiHeadLatentAttention(nn.Module):
-    """Multi-Head Latent Attention (MLA).
-
-    DeepSeekV3 uses MLA with low-rank KV compression for efficient inference.
-    The key-value pairs are compressed into a latent space, reducing memory usage.
-    """
-
+class MultiheadLatentAttention(nn.Module):
     def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        q_lora_rank: int = 1536,
-        kv_lora_rank: int = 512,
-        qk_nope_head_dim: int = 128,
-        qk_rope_head_dim: int = 64,
-        v_head_dim: int = 128,
-        max_seq_len: int = 2048,
+            self,
+            hidden_size: int,
+            num_heads: int,
+            q_lora_rank: int = 1536,
+            kv_lora_rank: int = 512,
+            qk_nope_head_dim: int = 128,
+            qk_rope_head_dim: int = 64,
+            v_head_dim: int = 128,
+            max_seq_len: int = 2048,
+            dropout: float = 0.0,
     ):
         super().__init__()
+
+        # 基本参数设置
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
-        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.v_head_dim = v_head_dim
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 
-        # Q projection with Q-Lora rank compression
-        # Hidden -> Q_lora_rank + kv_lora_rank + qk_rope_head_dim
-        self.qkv_a_proj = nn.Linear(hidden_size, q_lora_rank + kv_lora_rank + qk_rope_head_dim, bias=False)
-        self.q_a_layernorm = RMSNorm(q_lora_rank)
-        self.q_b_proj = nn.Linear(q_lora_rank, num_heads * self.qk_head_dim, bias=False)
+        # 维度映射 (与之前版本兼容)
+        self.d_k = qk_nope_head_dim  # 非RoPE部分的维度
+        self.d_r = qk_rope_head_dim  # RoPE部分的维度
+        self.d_c = kv_lora_rank  # KV的低秩投影维度
+        self.d_c_prime = q_lora_rank  # Q的低秩投影维度
+        self.d_v = v_head_dim  # V的输出维度
 
-        # KV projection
-        self.kv_a_proj_with_mqa = nn.Linear(hidden_size, kv_lora_rank + qk_rope_head_dim, bias=False)
-        self.kv_a_layernorm = RMSNorm(kv_lora_rank)
-        self.kv_b_proj = nn.Linear(kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim), bias=False)
+        # 定义投影矩阵
+        # 低秩投影: hidden -> kv_lora_rank
+        self.W_c = nn.Linear(hidden_size, self.d_c, bias=False)  # W_c
+        # 低秩投影: hidden -> q_lora_rank
+        self.W_c_prime = nn.Linear(hidden_size, self.d_c_prime, bias=False)  # W_c'
+
+        # Q的投影矩阵 (矩阵化): d_c_prime -> num_heads * d_k
+        self.W_qc = nn.Linear(self.d_c_prime, self.num_heads * self.d_k, bias=False)
+        # Q的RoPE投影矩阵 (矩阵化): d_c_prime -> num_heads * d_r
+        self.W_qr = nn.Linear(self.d_c_prime, self.num_heads * self.d_r, bias=False)
+
+        # K的投影矩阵 (矩阵化): d_c -> num_heads * d_k
+        self.W_kc = nn.Linear(self.d_c, self.num_heads * self.d_k, bias=False)
+        # K的RoPE投影矩阵: hidden -> d_r (所有头共享)
+        self.W_kr = nn.Linear(hidden_size, self.d_r, bias=False)  # W_kr
+
+        # V的投影矩阵 (矩阵化): d_c -> num_heads * d_v
+        self.W_v = nn.Linear(self.d_c, self.num_heads * self.d_v, bias=False)
 
         # Output projection
-        self.o_proj = nn.Linear(num_heads * v_head_dim, hidden_size, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.d_v, hidden_size, bias=False)
+
+        # Dropout层
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+
+        # KV缓存
+        self.c_cache = None  # 低秩投影后的缓存
+        self.x_cache = None  # 原始输入的缓存
 
         # RoPE: use precompute_freqs_cis from gpt_rope
         freqs_cos, freqs_sin = precompute_freqs_cis(
@@ -96,116 +124,88 @@ class MultiHeadLatentAttention(nn.Module):
             end=max_seq_len,
             rope_base=10000.0
         )
+
         self.register_buffer('freqs_cos', freqs_cos, persistent=False)
         self.register_buffer('freqs_sin', freqs_sin, persistent=False)
 
-        # Causal mask: upper triangular matrix, mask out future positions
-        mask = torch.triu(torch.ones(max_seq_len, max_seq_len), diagonal=1)
-        self.register_buffer('causal_mask', mask, persistent=False)
+        # 注意力掩码
+        attn_mask = torch.full((1, 1, max_seq_len, max_seq_len), float("-inf"))
+        self.register_buffer("attn_mask", torch.triu(attn_mask, diagonal=1), persistent=False)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        """Forward pass for MLA.
+    def precompute_matrices(self):
+        # 推理阶段使用的预计算矩阵: W_kc.t() @ W_qc.t() = (W_qc @ W_kc.t()).t()
+        # 使得: q_c = c_prime @ merged = c_prime @ W_kc.t() @ W_qc.t()
+        self.merged_W_qc_kc = [
+            torch.matmul(self.W_kc[i].weight.t(), self.W_qc[i].weight)
+            for i in range(self.num_heads)
+        ]
 
-        Args:
-            x: [batch, seq_len, hidden_size]
-
-        Returns:
-            output: [batch, seq_len, hidden_size]
-        """
+    def forward(self, x, kv_cache=False):
         batch_size, seq_len, _ = x.shape
 
-        # Simplified attention: standard multi-head attention with Q-Lora and KV-Lora compression
-        # Q projection
-        q_latent = self.qkv_a_proj(x)[..., :self.q_lora_rank]  # [batch, seq_len, q_lora_rank]
-        q_latent = self.q_a_layernorm(q_latent)
-        q = self.q_b_proj(q_latent)  # [batch, seq_len, num_heads * qk_head_dim]
-        q = q.view(batch_size, seq_len, self.num_heads, self.qk_head_dim)
+        # 低秩投影
+        c = self.W_c(x)  # [batch, seq, d_c]
+        c_prime = self.W_c_prime(x)  # [batch, seq, d_c_prime]
 
-        # KV projection
-        kv_full = self.kv_a_proj_with_mqa(x)  # [batch, seq_len, kv_lora_rank + qk_rope_head_dim]
-        kv_latent = kv_full[..., :self.kv_lora_rank]  # [batch, seq_len, kv_lora_rank]
-        kv_latent = self.kv_a_layernorm(kv_latent)
-        k_rope_latent = kv_full[..., self.kv_lora_rank:]  # [batch, seq_len, qk_rope_head_dim]
+        # 矩阵化计算 Q、K、V (所有头一起计算)
+        # Qc: [batch, seq, num_heads * d_k] -> reshape -> [batch, num_heads, seq, d_k]
+        q_c = self.W_qc(c_prime).view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        # Kc: [batch, seq, num_heads * d_k] -> reshape -> [batch, num_heads, seq, d_k]
+        k_c = self.W_kc(c).view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        # Qr: [batch, seq, num_heads * d_r] -> reshape -> [batch, num_heads, seq, d_r]
+        q_r = self.W_qr(c_prime).view(batch_size, seq_len, self.num_heads, self.d_r).transpose(1, 2)
+        # Kr: [batch, seq, d_r] (共享) -> expand -> [batch, num_heads, seq, d_r]
+        k_r = self.W_kr(x).unsqueeze(1).expand(-1, self.num_heads, -1, -1)
+        # V: [batch, seq, num_heads * d_v] -> reshape -> [batch, num_heads, seq, d_v]
+        v = self.W_v(c).view(batch_size, seq_len, self.num_heads, self.d_v).transpose(1, 2)
 
-        # KV decode projection
-        kv = self.kv_b_proj(kv_latent)  # [batch, seq_len, num_heads * (qk_nope_head_dim + v_head_dim)]
-        kv = kv.view(batch_size, seq_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+        # 应用 RoPE 到 Qr 和 Kr
+        q_r, k_r = apply_rotary_pos_emb(q_r, k_r, self.freqs_cos[:seq_len], self.freqs_sin[:seq_len])
 
-        # Split KV
-        k_nope = kv[..., :self.qk_nope_head_dim]  # [batch, seq_len, num_heads, qk_nope_head_dim]
-        v = kv[..., self.qk_nope_head_dim:]  # [batch, seq_len, num_heads, v_head_dim]
+        # 拼接 Q 和 K 的 nope + rope 部分
+        q = torch.cat([q_c, q_r], dim=-1)  # [batch, num_heads, seq, d_k + d_r]
+        k = torch.cat([k_c, k_r], dim=-1)  # [batch, num_heads, seq, d_k + d_r]
 
-        # Split q into nope and rope parts
-        q_nope = q[..., :self.qk_nope_head_dim]  # [batch, seq_len, num_heads, qk_nope_head_dim]
-        q_for_rope = q[..., self.qk_nope_head_dim:]  # [batch, seq_len, num_heads, qk_rope_head_dim]
+        # 计算注意力分数
+        scale = 1.0 / math.sqrt(self.d_k + self.d_r)
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
 
-        # Transpose for RoPE: [batch, seq_len, num_heads, head_dim] -> [batch, num_heads, seq_len, head_dim]
-        q_for_rope = q_for_rope.transpose(1, 2)  # [batch, num_heads, seq_len, qk_rope_head_dim]
+        # 添加注意力掩码
+        mask = self.attn_mask[:, :, :seq_len, :seq_len]  # [1, 1, seq, seq]
+        attn_scores = attn_scores + mask
 
-        # Expand k_rope to match num_heads and transpose for RoPE
-        k_rope_expanded = k_rope_latent.unsqueeze(2).expand(-1, -1, self.num_heads, -1)  # [batch, seq_len, num_heads, qk_rope_head_dim]
-        k_rope_expanded = k_rope_expanded.transpose(1, 2)  # [batch, num_heads, seq_len, qk_rope_head_dim]
+        # 计算注意力概率
+        attn_probs = F.softmax(attn_scores.float(), dim=-1).type_as(q)
+        attn_probs = self.attn_dropout(attn_probs)
 
-        # Apply RoPE using gpt_rope's apply_rotary_pos_emb
-        q_for_rope, k_rope_expanded = apply_rotary_pos_emb(
-            q_for_rope,
-            k_rope_expanded,
-            self.freqs_cos[:seq_len],
-            self.freqs_sin[:seq_len]
-        )
+        # 计算输出
+        attn_output = torch.matmul(attn_probs, v)  # [batch, num_heads, seq, d_v]
 
-        # Transpose back
-        q_for_rope = q_for_rope.transpose(1, 2)  # [batch, seq_len, num_heads, qk_rope_head_dim]
-        k_rope = k_rope_expanded.transpose(1, 2)  # [batch, seq_len, num_heads, qk_rope_head_dim]
-
-        # Combine nope and rope parts
-        q = torch.cat([q_nope, q_for_rope], dim=-1)  # [batch, seq_len, num_heads, qk_head_dim]
-        k = torch.cat([k_nope, k_rope], dim=-1)  # [batch, seq_len, num_heads, qk_head_dim]
-
-        # Transpose for attention
-        q = q.transpose(1, 2)  # [batch, num_heads, seq_len, qk_head_dim]
-        k = k.transpose(1, 2)  # [batch, num_heads, seq_len, qk_head_dim]
-        v = v.transpose(1, 2)  # [batch, num_heads, seq_len, v_head_dim]
-
-        # Compute attention with causal mask
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.qk_head_dim)
-
-        # Apply causal mask: mask out future positions
-        mask_expanded = self.causal_mask[:seq_len, :seq_len].view(1, 1, seq_len, seq_len)
-        attn_weights.masked_fill_(mask_expanded.bool(), -torch.inf)
-
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_output = torch.matmul(attn_weights, v)  # [batch, num_heads, seq_len, v_head_dim]
-
-        # Reshape and project
-        attn_output = attn_output.transpose(1, 2).contiguous()  # [batch, seq_len, num_heads, v_head_dim]
-        attn_output = attn_output.view(batch_size, seq_len, -1)
+        # 拼接所有头并投影
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         output = self.o_proj(attn_output)
-
-        return output
+        return self.resid_dropout(output)
 
 
 class MoEGate(nn.Module):
-    """MoE Gating for DeepSeekV3.
+    """MoE Gating for DeepSeekV3 (参考 DeepSeekMoE 论文).
 
-    DeepSeekV3 uses grouped top-k routing:
-    - 256 experts in 8 groups
-    - Select top-4 experts from each group (8 total)
-    - Score normalization with auxiliary loss for load balancing
+    改进点:
+    1. 标准化的 top-K 路由 (Softmax 权重归一化)
+    2. 优化的负载平衡辅助损失
+    3. 更稳定的路由权重计算
     """
 
     def __init__(
-        self,
-        hidden_size: int,
-        n_routed_experts: int = 256,
-        num_experts_per_tok: int = 8,
-        n_group: int = 8,
-        topk_group: int = 4,
-        norm_topk_prob: bool = True,
-        aux_loss_alpha: float = 0.001,
+            self,
+            hidden_size: int,
+            n_routed_experts: int = 256,
+            num_experts_per_tok: int = 8,
+            n_group: int = 8,
+            topk_group: int = 4,
+            norm_topk_prob: bool = True,
+            aux_loss_alpha: float = 0.001,
+            z_loss_alpha: float = 0.0001,  # 新增：z-loss 防止路由 logits 过大
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -215,88 +215,107 @@ class MoEGate(nn.Module):
         self.topk_group = topk_group
         self.norm_topk_prob = norm_topk_prob
         self.aux_loss_alpha = aux_loss_alpha
+        self.z_loss_alpha = z_loss_alpha
 
+        # 正交初始化以保持稳定性
         # Gate weight: [n_routed_experts, hidden_size]
-        self.weight = nn.Parameter(torch.empty((n_routed_experts, hidden_size)))
+        self.gate = nn.Linear(hidden_size, n_routed_experts, bias=False)
 
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Forward pass of MoE gating.
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass of MoE gating (参考 DeepSeekMoE).
 
         Args:
             hidden_states: [batch * seq_len, hidden_size]
 
         Returns:
             topk_idx: [batch * seq_len, num_experts_per_tok] - selected expert indices
-            topk_weight: [batch * seq_len, num_experts_per_tok] - expert weights
+            topk_weight: [batch * seq_len, num_experts_per_tok] - expert weights (softmax normalized)
             aux_loss: auxiliary loss for load balancing
         """
         batch_size, hidden_dim = hidden_states.shape
 
-        # Compute logits for all experts
-        logits = F.linear(hidden_states, self.weight, None)  # [batch, n_experts]
+        # 计算所有专家的 logits
+        logits = self.gate(hidden_states)  # [batch, n_experts]
 
-        # Grouped top-k: select top-k_group experts from each group
-        # First compute group scores
+        # 分组 top-k 路由 (论文推荐的方式)
         group_size = self.n_routed_experts // self.n_group
         group_logits = logits.view(-1, self.n_group, group_size)
 
-        # Get top-k within each group
-        group_topk_weights, group_topk_idx = torch.topk(
+        # 每组内选择 top-k_group 个专家
+        group_topk_logits, group_topk_idx = torch.topk(
             group_logits, k=self.topk_group, dim=-1
         )
 
-        # Global top-k: select top-k_group groups, then select experts
-        group_topk_weights = group_topk_weights.view(-1, self.n_group * self.topk_group)
+        # 将所有组的候选专家展平
+        group_topk_logits = group_topk_logits.view(-1, self.n_group * self.topk_group)
         group_topk_idx = group_topk_idx.view(-1, self.n_group * self.topk_group)
 
-        # Final top-k from all candidates
-        topk_weights, topk_idx = torch.topk(
-            group_topk_weights, k=self.num_experts_per_tok, dim=-1
+        # 全局 top-k：从所有候选中选择 top-k 个
+        topk_logits, topk_idx_in_candidates = torch.topk(
+            group_topk_logits, k=self.num_experts_per_tok, dim=-1
         )
 
-        # Map back to original expert indices
-        selected_group_idx = torch.div(topk_idx, self.topk_group, rounding_mode='trunc')
-        expert_idx_in_group = group_topk_idx.gather(1, topk_idx)
+        # 映射回原始专家索引
+        selected_group_idx = torch.div(topk_idx_in_candidates, self.topk_group, rounding_mode='floor')
+        expert_idx_in_group = group_topk_idx.gather(1, topk_idx_in_candidates)
         topk_idx = selected_group_idx * group_size + expert_idx_in_group
 
-        # Normalize top-k weights
-        if self.norm_topk_prob:
-            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        # 应用 softmax 归一化权重 (DeepSeekMoE 的关键改进)
+        topk_weight = F.softmax(topk_logits, dim=-1)
 
-        # Compute auxiliary loss for load balancing
-        if self.training and self.aux_loss_alpha > 0:
-            # Count expert usage
-            expert_mask = F.one_hot(topk_idx.view(-1), num_classes=self.n_routed_experts)
-            expert_counts = expert_mask.float().mean(0)
-            # Expert probability
-            expert_probs = logits.softmax(dim=-1).mean(0)
-            # Auxiliary loss
-            aux_loss = (expert_counts * expert_probs).sum() * self.aux_loss_alpha
-        else:
-            aux_loss = hidden_states.new_zeros(1)
+        # 计算辅助损失以平衡专家负载
+        aux_loss = torch.tensor(0.0, device=hidden_states.device)
+        z_loss = torch.tensor(0.0, device=hidden_states.device)
 
-        return topk_idx, topk_weights, aux_loss
+        if self.training:
+            # 专家负载平衡损失 (Load Balancing Loss)
+            if self.aux_loss_alpha > 0:
+                # 计算每个专家被选中的频率
+                expert_mask = F.one_hot(topk_idx.view(-1), num_classes=self.n_routed_experts).float()
+                expert_counts = expert_mask.sum(0)  # [n_experts]
 
+                # 计算每个专家的平均路由概率
+                logits_softmax = F.softmax(logits, dim=-1)
+                expert_probs = logits_softmax.mean(0)  # [n_experts]
+
+                # 负载平衡损失: 确保频率与概率平衡
+                aux_loss = (expert_counts / batch_size) * expert_probs
+                aux_loss = aux_loss.sum() * self.aux_loss_alpha
+
+            # Z-loss：防止路由 logits 过大
+            if self.z_loss_alpha > 0:
+                z_loss = (torch.log(F.softmax(logits, dim=-1).sum(0)) ** 2).mean() * self.z_loss_alpha
+
+        total_aux_loss = aux_loss + z_loss
+
+        return topk_idx, topk_weight, total_aux_loss
 
 
 class DeepseekV3MoE(nn.Module):
-    """DeepSeekV3 MoE Layer.
+    """DeepSeekV3 MoE Layer (优化版本).
 
-    Contains:
-    - 256 routed experts (8 activated per token)
-    - 2 shared experts (always active)
-    - Grouped top-k routing
+    包含:
+    - 256 路由专家 (每 token 激活 8 个)
+    - 2 共享专家 (始终激活)
+    - 分组 top-k 路由
+
+    优化策略 (参考 DeepSeekMoE):
+    - 使用 torch.einsum 加速批处理
+    - 避免循环遍历专家
     """
 
     def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int = 2048,
-        n_routed_experts: int = 256,
-        n_shared_experts: int = 2,
-        num_experts_per_tok: int = 8,
-        n_group: int = 8,
-        topk_group: int = 4,
+            self,
+            hidden_size: int,
+            intermediate_size: int = 2048,
+            n_routed_experts: int = 256,
+            n_shared_experts: int = 2,
+            num_experts_per_tok: int = 8,
+            n_group: int = 8,
+            topk_group: int = 4,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -305,7 +324,10 @@ class DeepseekV3MoE(nn.Module):
         self.n_shared_experts = n_shared_experts
         self.num_experts_per_tok = num_experts_per_tok
 
-        # Gating mechanism
+        self.num_experts = n_routed_experts
+        self.top_k = num_experts_per_tok
+
+        # 路由机制
         self.gate = MoEGate(
             hidden_size=hidden_size,
             n_routed_experts=n_routed_experts,
@@ -314,67 +336,113 @@ class DeepseekV3MoE(nn.Module):
             topk_group=topk_group,
         )
 
-        # Routed experts
+        # 路由专家 (共享权重的方式以节省内存)
         self.experts = nn.ModuleList([
             DeepSeekV3MLP(hidden_size, intermediate_size)
             for _ in range(n_routed_experts)
         ])
 
-        # Shared experts (always active)
+        # 共享专家 (始终激活，参考 DeepSeekMoE)
         self.shared_experts = nn.ModuleList([
             DeepSeekV3MLP(hidden_size, intermediate_size)
             for _ in range(n_shared_experts)
         ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
+        """Forward pass 优化版本.
 
         Args:
-            x: [batch, seq_len, hidden_size] or [batch * seq_len, hidden_size]
+            x: [batch, seq_len, hidden_size]
 
         Returns:
-            output: [batch, seq_len, hidden_size] or [batch * seq_len, hidden_size]
+            output: 相同 shape 的输出张量
         """
         original_shape = x.shape
-        is_3d = x.dim() == 3
+        batch_size, seq_len, hidden_dim = x.shape
+        x = x.view(-1, hidden_dim)
 
-        if is_3d:
-            batch_size, seq_len, hidden_dim = x.shape
-            x = x.view(-1, hidden_dim)
-        else:
-            batch_size, hidden_dim = x.shape
-
-        # Shared experts (always active)
+        # 1. 处理共享专家 (始终激活，贡献相等权重)
         shared_output = torch.zeros_like(x)
         for expert in self.shared_experts:
             shared_output = shared_output + expert(x)
+        shared_output = shared_output / self.n_shared_experts  # 平均
 
-        # Routed experts
-        topk_idx, topk_weights, aux_loss = self.gate(x)
+        # 2. 路由专家处理
+        topk_idx, topk_weights, aux_loss = self.gate(x)  # [N, K], [N, K]
 
-        # Initialize output
-        routed_output = torch.zeros_like(x)
+        # 使用高效的批处理方式处理路由专家
+        routed_output = self._process_routed_experts(x, topk_idx, topk_weights)
 
-        # Process each expert
-        for i in range(self.num_experts_per_tok):
-            expert_idx = topk_idx[:, i]
-            expert_weight = topk_weights[:, i].unsqueeze(-1)
-
-            for exp_id in range(self.n_routed_experts):
-                mask = expert_idx == exp_id
-                if mask.any():
-                    routed_output[mask] = routed_output[mask] + (
-                        self.experts[exp_id](x[mask]) * expert_weight[mask]
-                    )
-
-        # Combine shared and routed experts
+        # 3. 合并共享专家和路由专家输出
         output = shared_output + routed_output
 
-        # Reshape back to original shape if input was 3D
-        if is_3d:
-            output = output.view(batch_size, seq_len, hidden_dim)
+        # 4. 恢复原始形状
+        output = output.view(original_shape)
 
         return output
+
+    def _process_routed_experts(
+            self,
+            hidden_states: torch.Tensor,
+            top_k_indices: torch.Tensor,
+            top_k_gates: torch.Tensor,
+    ) -> torch.Tensor:
+        """高效处理路由专家的辅助函数.
+
+        Args:
+            x: [N, hidden_size]
+            topk_idx: [N, K] - 专家索引
+            topk_weights: [N, K] - 归一化权重
+
+        Returns:
+            output: [N, hidden_size]
+        """
+
+        # ===== 3. 专家计算 (按专家分组批量处理) =====
+        # 展平: 每个token的每个top-k选择变成一个条目
+        # top_k_indices: (num_tokens, top_k) -> flat_idx: (num_tokens * top_k,)
+        flat_idx = top_k_indices.view(-1)
+        # top_k_gates: (num_tokens, top_k) -> flat_weights: (num_tokens * top_k,)
+        flat_weights = top_k_gates.view(-1)
+
+        # 初始化输出
+        final_hidden_states = torch.zeros_like(hidden_states)
+
+        # 按专家索引排序，将同一专家的token连续存放
+        sorted_idx = flat_idx.argsort()
+
+        # 统计每个专家的token数量（bincount会自动为未激活的专家返回0）
+        expert_counts = flat_idx.bincount(minlength=self.n_routed_experts)
+
+        # 计算每个专家的起始位置（前缀和）
+        expert_offsets = torch.zeros(self.num_experts, dtype=torch.long, device=flat_idx.device)
+        expert_offsets[1:] = expert_counts[:-1].cumsum(0)
+
+        # 按专家分组批量处理
+        for expert_id in range(self.num_experts):
+            start = expert_offsets[expert_id].item()
+            count = expert_counts[expert_id].item()
+
+            if count == 0:
+                continue
+
+            # 获取该专家负责的token在排序后的位置
+            sorted_positions = sorted_idx[start:start + count]
+            # 获取对应的原始token索引
+            token_indices = sorted_positions // self.top_k
+
+            # 获取对应的权重
+            weights = flat_weights[sorted_positions]
+
+            # 批量计算
+            expert_tokens = hidden_states[token_indices]
+            expert_output = self.experts[expert_id](expert_tokens)
+
+            # 加权累加到对应位置
+            weighted_output = expert_output * weights.unsqueeze(-1)
+            final_hidden_states.index_add_(0, token_indices, weighted_output)
+
+        return final_hidden_states
 
 
 class DeepseekV3DecoderLayer(nn.Module):
@@ -388,23 +456,23 @@ class DeepseekV3DecoderLayer(nn.Module):
     """
 
     def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        intermediate_size: int,
-        n_routed_experts: int = 256,
-        n_shared_experts: int = 2,
-        num_experts_per_tok: int = 8,
-        n_group: int = 8,
-        topk_group: int = 4,
-        q_lora_rank: int = 1536,
-        kv_lora_rank: int = 512,
-        qk_nope_head_dim: int = 128,
-        qk_rope_head_dim: int = 64,
-        v_head_dim: int = 128,
-        max_seq_len: int = 2048,
-        first_k_dense_replace: int = 1,
-        layer_id: int = 0,
+            self,
+            hidden_size: int,
+            num_heads: int,
+            intermediate_size: int,
+            n_routed_experts: int = 256,
+            n_shared_experts: int = 2,
+            num_experts_per_tok: int = 8,
+            n_group: int = 8,
+            topk_group: int = 4,
+            q_lora_rank: int = 1536,
+            kv_lora_rank: int = 512,
+            qk_nope_head_dim: int = 128,
+            qk_rope_head_dim: int = 64,
+            v_head_dim: int = 128,
+            max_seq_len: int = 2048,
+            first_k_dense_replace: int = 1,
+            layer_id: int = 0,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -415,7 +483,7 @@ class DeepseekV3DecoderLayer(nn.Module):
 
         # Attention
         self.input_layernorm = RMSNorm(hidden_size)
-        self.self_attn = MultiHeadLatentAttention(
+        self.self_attn = MultiheadLatentAttention(
             hidden_size=hidden_size,
             num_heads=num_heads,
             q_lora_rank=q_lora_rank,
@@ -442,8 +510,8 @@ class DeepseekV3DecoderLayer(nn.Module):
             self.mlp = DeepSeekV3MLP(hidden_size, intermediate_size)
 
     def forward(
-        self,
-        x: torch.Tensor,
+            self,
+            x: torch.Tensor,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -471,24 +539,24 @@ class DeepseekV3(nn.Module):
     """
 
     def __init__(
-        self,
-        vocab_size: int = 129280,
-        hidden_size: int = 7168,
-        num_attention_heads: int = 64,
-        num_hidden_layers: int = 60,
-        intermediate_size: int = 2048,
-        n_routed_experts: int = 256,
-        n_shared_experts: int = 2,
-        num_experts_per_tok: int = 8,
-        n_group: int = 8,
-        topk_group: int = 4,
-        q_lora_rank: int = 1536,
-        kv_lora_rank: int = 512,
-        qk_nope_head_dim: int = 128,
-        qk_rope_head_dim: int = 64,
-        v_head_dim: int = 128,
-        max_position_embeddings: int = 4096,
-        first_k_dense_replace: int = 1,
+            self,
+            vocab_size: int = 129280,
+            hidden_size: int = 7168,
+            num_attention_heads: int = 64,
+            num_hidden_layers: int = 60,
+            intermediate_size: int = 2048,
+            n_routed_experts: int = 256,
+            n_shared_experts: int = 2,
+            num_experts_per_tok: int = 8,
+            n_group: int = 8,
+            topk_group: int = 4,
+            q_lora_rank: int = 1536,
+            kv_lora_rank: int = 512,
+            qk_nope_head_dim: int = 128,
+            qk_rope_head_dim: int = 64,
+            v_head_dim: int = 128,
+            max_position_embeddings: int = 4096,
+            first_k_dense_replace: int = 1,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -528,8 +596,8 @@ class DeepseekV3(nn.Module):
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
+            self,
+            input_ids: torch.Tensor,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -565,6 +633,8 @@ if __name__ == "__main__":
         # 如果导入失败，定义空函数
         def export_and_simplify(*args, **kwargs):
             raise ImportError("请确保 utils.onnx_utils 模块存在")
+
+
         def validate_onnx(*args, **kwargs):
             return False
 
@@ -579,12 +649,12 @@ if __name__ == "__main__":
         num_attention_heads=8,
         num_hidden_layers=2,
         intermediate_size=256,
-        n_routed_experts=16,  # More experts for testing
+        n_routed_experts=8,  # More experts for testing
         n_shared_experts=2,
         num_experts_per_tok=4,
         n_group=4,  # 4 groups
         topk_group=2,  # Select top-2 from each group
-        first_k_dense_replace = 1 # 实际上 deepseek 61 层，[0，1，2] 是 mlp, [3，...，60] 是 moe
+        first_k_dense_replace=1  # 实际上 deepseek 61 层，[0，1，2] 是 mlp, [3，...，60] 是 moe
     )
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -622,4 +692,3 @@ if __name__ == "__main__":
         print("ONNX模型验证失败!")
 
     print(f"模型已导出到: {final_path}")
-

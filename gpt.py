@@ -12,7 +12,7 @@ from utils.onnx_utils import export_and_simplify, validate_onnx
 from visualization.positional_encoding_visualization import PositionalEncoding
 
 
-class MultiHeadCausalAttention(nn.Module):
+class MultiHeadAttention(nn.Module):
     """多头注意力"""
 
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, max_seq_len=1024):
@@ -104,7 +104,7 @@ class GPTTransformerBlock(nn.Module):
         super().__init__()
         # Pre-LN结构（GPT的特点）
         self.ln1 = nn.LayerNorm(d_model)
-        self.attn = MultiHeadCausalAttention(d_model, n_heads, dropout)
+        self.attn = MultiHeadAttention(d_model, n_heads, dropout)
         self.ln2 = nn.LayerNorm(d_model)
         self.ff = FeedForward(d_model, d_ff, dropout)
         self.dropout = nn.Dropout(dropout)
