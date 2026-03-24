@@ -129,8 +129,8 @@ class MultiheadLatentAttention(nn.Module):
         self.register_buffer('freqs_sin', freqs_sin, persistent=False)
 
         # 注意力掩码
-        attn_mask = torch.full((1, 1, max_seq_len, max_seq_len), float("-inf"))
-        self.register_buffer("attn_mask", torch.triu(attn_mask, diagonal=1), persistent=False)
+        causal_mask = torch.triu(torch.ones(max_seq_len, max_seq_len), diagonal=1)
+        self.register_buffer("causal_mask", causal_mask, persistent=False)
 
     def precompute_matrices(self):
         # 推理阶段使用的预计算矩阵: W_kc.t() @ W_qc.t() = (W_qc @ W_kc.t()).t()
@@ -170,9 +170,10 @@ class MultiheadLatentAttention(nn.Module):
         scale = 1.0 / math.sqrt(self.d_k + self.d_r)
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
 
-        # 添加注意力掩码
-        mask = self.attn_mask[:, :, :seq_len, :seq_len]  # [1, 1, seq, seq]
-        attn_scores = attn_scores + mask
+        # 应用因果掩码（上三角矩阵）
+        # 扩展mask维度以匹配多头注意力: [1, 1, seq_len, seq_len]
+        mask_expanded = self.causal_mask[:seq_len, :seq_len].view(1, 1, seq_len, seq_len)
+        attn_scores.masked_fill_(mask_expanded.bool(), -torch.inf)
 
         # 计算注意力概率
         attn_probs = F.softmax(attn_scores.float(), dim=-1).type_as(q)
