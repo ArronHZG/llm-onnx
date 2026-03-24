@@ -17,9 +17,35 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from gpt import FeedForward
 from gpt_rope import precompute_freqs_cis, apply_rotary_pos_emb
+from qwen3_dense import SwiGLU
 
 RMSNorm = nn.LayerNorm
+
+
+class DeepSeekV3MLP(nn.Module):
+    """DeepSeekV3 MLP layer (single expert)."""
+
+    def __init__(self, hidden_size: int, intermediate_size: int):
+        super().__init__()
+        self.gate_up_proj = nn.Linear(hidden_size, intermediate_size * 2, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.act_fn = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.gate_up_proj(x)
+        gate, up = x.chunk(2, dim=-1)
+        x = self.act_fn(gate) * up
+        x = self.down_proj(x)
+        return x
+
+
+# 简化模型结构
+SwiGLU = FeedForward
+
+# Deepseek mlp 就是 SwiGLU
+DeepSeekV3MLP = SwiGLU
 
 
 class MultiHeadLatentAttention(nn.Module):
@@ -252,22 +278,6 @@ class MoEGate(nn.Module):
         return topk_idx, topk_weights, aux_loss
 
 
-class DeepSeekV3MLP(nn.Module):
-    """DeepSeekV3 MLP layer (single expert)."""
-
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        self.gate_up_proj = nn.Linear(hidden_size, intermediate_size * 2, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-        self.act_fn = nn.SiLU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.gate_up_proj(x)
-        gate, up = x.chunk(2, dim=-1)
-        x = self.act_fn(gate) * up
-        x = self.down_proj(x)
-        return x
-
 
 class DeepseekV3MoE(nn.Module):
     """DeepSeekV3 MoE Layer.
@@ -444,17 +454,13 @@ class DeepseekV3DecoderLayer(nn.Module):
             output: [batch, seq_len, hidden_size]
         """
         # Self-attention with pre-norm
-        x = x + self.self_attn(
-            self.input_layernorm(x),
-        )
-
+        x = x + self.self_attn(self.input_layernorm(x))
         # FFN with pre-norm
         x = x + self.mlp(self.post_attention_layernorm(x))
-
         return x
 
 
-class DeepseekV3ForCausalLM(nn.Module):
+class DeepseekV3(nn.Module):
     """DeepSeekV3 for Causal Language Modeling.
 
     包含:
@@ -567,7 +573,7 @@ if __name__ == "__main__":
     seq_len = 8
     max_new_tokens = 10
 
-    model = DeepseekV3ForCausalLM(
+    model = DeepseekV3(
         vocab_size=1000,
         hidden_size=512,
         num_attention_heads=8,
@@ -578,6 +584,7 @@ if __name__ == "__main__":
         num_experts_per_tok=4,
         n_group=4,  # 4 groups
         topk_group=2,  # Select top-2 from each group
+        first_k_dense_replace = 1 # 实际上 deepseek 61 层，[0，1，2] 是 mlp, [3，...，60] 是 moe
     )
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -597,7 +604,7 @@ if __name__ == "__main__":
     onnx_path = "onnx_data/deepseekv3.onnx"
 
     # 导出并简化ONNX模型
-    # 注意: deepseekv3 forward 需要两个输入: input_ids 和 positions
+    # 添加 dynamic_axes 支持动态 batch 和 sequence 维度
     final_path = export_and_simplify(
         model=model,
         dummy_input=(input_ids,),  # 只传入 input_ids
