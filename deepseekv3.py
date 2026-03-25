@@ -188,7 +188,7 @@ class MultiheadLatentAttention(nn.Module):
         return self.resid_dropout(output)
 
 
-class MoEGate(nn.Module):
+class DeepseekMoEGate(nn.Module):
     """MoE Gating for DeepSeekV3 (参考 DeepSeekMoE 论文).
 
     改进点:
@@ -329,7 +329,7 @@ class DeepseekV3MoE(nn.Module):
         self.top_k = num_experts_per_tok
 
         # 路由机制
-        self.gate = MoEGate(
+        self.gate = DeepseekMoEGate(
             hidden_size=hidden_size,
             n_routed_experts=n_routed_experts,
             num_experts_per_tok=num_experts_per_tok,
