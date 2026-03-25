@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from deepseekv3 import DeepseekMoEGate, DeepseekV3MoE
+from deepseekv3 import DeepseekV3MoE
 from gpt import FeedForward
 from gpt_rope import apply_rotary_pos_emb, precompute_freqs_cis
 
@@ -145,7 +145,13 @@ class LightningIndexerNSA(nn.Module):
 class MultiheadLatentAttentionV3_2(nn.Module):
     """DeepSeekV3.2 Multi-Head Latent Attention (MLA) with NSA support.
 
-    包含 Lightning Indexer (NSA) 用于稀疏注意力加速。
+    按照图中的架构：
+    1. Q 下采样 (compress_q) -> Linear down project/lora
+    2. KV 下采样 (compress_kv) -> Linear down project/lora -> RMSNorm
+    3. KV 上采样 (Linear up project)
+    4. RoPE 应用到 q_pe 和 k_pe
+    5. 计算注意力
+    6. 输出投影
     """
 
     def __init__(
@@ -176,49 +182,38 @@ class MultiheadLatentAttentionV3_2(nn.Module):
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.v_head_dim = v_head_dim
-        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 
         # NSA 参数
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
         self.index_topk = index_topk
 
-        # 维度映射
-        self.d_k = qk_nope_head_dim  # 非RoPE部分的维度
-        self.d_r = qk_rope_head_dim  # RoPE部分的维度
-        self.d_c = kv_lora_rank  # KV的低秩投影维度
-        self.d_c_prime = q_lora_rank  # Q的低秩投影维度
-        self.d_v = v_head_dim  # V的输出维度
+        # ===== Q 投影 (下采样) =====
+        # compress_q: hidden_size -> q_lora_rank
+        self.compress_q = nn.Linear(hidden_size, q_lora_rank, bias=False)
+        # KV RMSNorm (针对 compress_q 部分)
+        self.q_norm = RMSNorm(q_lora_rank)
+        # Q 上采样: q_lora_rank -> num_heads * (qk_nope_head_dim + qk_rope_head_dim)
+        self.W_q_proj = nn.Linear(q_lora_rank, num_heads * (qk_nope_head_dim + qk_rope_head_dim), bias=False)
 
-        # 定义投影矩阵
-        # 低秩投影: hidden -> kv_lora_rank
-        self.W_c = nn.Linear(hidden_size, self.d_c, bias=False)  # W_c
-        # 低秩投影: hidden -> q_lora_rank
-        self.W_c_prime = nn.Linear(hidden_size, self.d_c_prime, bias=False)  # W_c'
 
-        # Q的投影矩阵 (矩阵化): d_c_prime -> num_heads * d_k
-        self.W_qc = nn.Linear(self.d_c_prime, self.num_heads * self.d_k, bias=False)
-        # Q的RoPE投影矩阵 (矩阵化): d_c_prime -> num_heads * d_r
-        self.W_qr = nn.Linear(self.d_c_prime, self.num_heads * self.d_r, bias=False)
+        # ===== KV 投影 (下采样) =====
+        # compress_kv: hidden_size -> (qk_rope_head_dim + qk_nope_head_dim) * num_heads
+        # 输出维度为 qk_rope + qk_nope (用于镜像切分)
+        self.compress_kv = nn.Linear(hidden_size, num_heads * (qk_rope_head_dim + qk_nope_head_dim), bias=False)
 
-        # K的投影矩阵 (矩阵化): d_c -> num_heads * d_k
-        self.W_kc = nn.Linear(self.d_c, self.num_heads * self.d_k, bias=False)
-        # K的RoPE投影矩阵: hidden -> d_r (所有头共享)
-        self.W_kr = nn.Linear(hidden_size, self.d_r, bias=False)  # W_kr
+        # KV RMSNorm (针对 kv_nope 部分)
+        self.kv_norm = RMSNorm(qk_nope_head_dim)
 
-        # V的投影矩阵 (矩阵化): d_c -> num_heads * d_v
-        self.W_v = nn.Linear(self.d_c, self.num_heads * self.d_v, bias=False)
+        # KV 上采样: qk_nope_head_dim -> (qk_nope_head_dim + v_head_dim)
+        self.W_kv_proj = nn.Linear(qk_nope_head_dim, qk_nope_head_dim + v_head_dim, bias=False)
 
         # Output projection
-        self.o_proj = nn.Linear(self.num_heads * self.d_v, hidden_size, bias=False)
+        self.o_proj = nn.Linear(num_heads * v_head_dim, hidden_size, bias=False)
 
         # Dropout层
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
-
-        # NV 缓存
-        self.c_cache = None  # 低秩投影后的缓存
-        self.x_cache = None  # 原始输入的缓存
 
         # RoPE: use precompute_freqs_cis from gpt_rope
         freqs_cos, freqs_sin = precompute_freqs_cis(
@@ -254,33 +249,62 @@ class MultiheadLatentAttentionV3_2(nn.Module):
     def forward(self, x, kv_cache=False):
         batch_size, seq_len, _ = x.shape
 
-        # ===== 主干注意力计算 =====
+        # ===== Q 投影路径 =====
+        # compress_q: [batch, seq, hidden] -> [batch, seq, q_lora_rank]
+        q_compressed = self.compress_q(x)
+        # RMSNorm
+        q_compressed = self.q_norm(q_compressed)
+        # Q 上采样: [batch, seq, q_lora_rank] -> [batch, seq, num_heads * (qk_nope + qk_pe)]
+        q_projected = self.W_q_proj(q_compressed)
 
-        # 低秩投影
-        c = self.W_c(x)  # [batch, seq, d_c]
-        c_prime = self.W_c_prime(x)  # [batch, seq, d_c_prime]
+        # View & Split: [batch, seq, num_heads * (qk_nope + qk_pe)] -> [batch, num_heads, seq, qk_nope + qk_pe]
+        q_projected = q_projected.view(batch_size, seq_len, self.num_heads, -1)
+        q_projected = q_projected.transpose(1, 2)  # [batch, num_heads, seq, qk_nope + qk_pe]
 
-        # 矩阵化计算 Q、K、V (所有头一起计算)
-        # Qc: [batch, seq, num_heads * d_k] -> reshape -> [batch, num_heads, seq, d_k]
-        q_c = self.W_qc(c_prime).view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
-        # Kc: [batch, seq, num_heads * d_k] -> reshape -> [batch, num_heads, seq, d_k]
-        k_c = self.W_kc(c).view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
-        # Qr: [batch, seq, num_heads * d_r] -> reshape -> [batch, num_heads, seq, d_r]
-        q_r = self.W_qr(c_prime).view(batch_size, seq_len, self.num_heads, self.d_r).transpose(1, 2)
-        # Kr: [batch, seq, d_r] (共享) -> expand -> [batch, num_heads, seq, d_r]
-        k_r = self.W_kr(x).unsqueeze(1).expand(-1, self.num_heads, -1, -1)
-        # V: [batch, seq, num_heads * d_v] -> reshape -> [batch, num_heads, seq, d_v]
-        v = self.W_v(c).view(batch_size, seq_len, self.num_heads, self.d_v).transpose(1, 2)
+        # 分离 q_nope 和 q_pe
+        q_nope = q_projected[:, :, :, :self.qk_nope_head_dim]  # [batch, num_heads, seq, qk_nope_head_dim]
+        q_pe = q_projected[:, :, :, self.qk_nope_head_dim:]  # [batch, num_heads, seq, qk_rope_head_dim]
 
-        # 应用 RoPE 到 Qr 和 Kr
-        q_r, k_r = apply_rotary_pos_emb(q_r, k_r, self.freqs_cos[:seq_len], self.freqs_sin[:seq_len])
+        # ===== KV 投影路径 =====
+        # compress_kv: [batch, seq, hidden] -> [batch, seq, num_heads * (qk_rope + qk_nope)]
+        kv_compressed = self.compress_kv(x)
 
-        # 拼接 Q 和 K 的 nope + rope 部分
-        q = torch.cat([q_c, q_r], dim=-1)  # [batch, num_heads, seq, d_k + d_r]
-        k = torch.cat([k_c, k_r], dim=-1)  # [batch, num_heads, seq, d_k + d_r]
+        # View & Split (镜像切分): [batch, seq, num_heads * (qk_rope + qk_nope)] -> [batch, num_heads, seq, qk_rope + qk_nope]
+        # 注意：这里的 qk_rope 对应 k_pe，qk_nope 对应 kv_nope
+        kv_compressed_split = kv_compressed.view(batch_size, seq_len, self.num_heads, -1)
+        kv_compressed_split = kv_compressed_split.transpose(1, 2)  # [batch, num_heads, seq, qk_rope + qk_nope]
 
-        # 计算注意力分数
-        scale = 1.0 / math.sqrt(self.d_k + self.d_r)
+        # 镜像切分：获得 k_pe 和 kv_nope
+        k_pe = kv_compressed_split[:, :, :, :self.qk_rope_head_dim]  # [batch, num_heads, seq, qk_rope_head_dim]
+        kv_nope = kv_compressed_split[:, :, :, self.qk_rope_head_dim:]  # [batch, num_heads, seq, qk_nope_head_dim]
+
+        # kv_nope 展平处理 RMSNorm 和 Linear up project
+        # [batch, num_heads, seq, qk_nope_head_dim] -> [batch*num_heads*seq, qk_nope_head_dim]
+        kv_nope_flat = kv_nope.contiguous().view(-1, self.qk_nope_head_dim)
+
+        # RMSNorm
+        kv_nope_flat = self.kv_norm(kv_nope_flat)
+
+        # Linear up project: qk_nope_head_dim -> (qk_nope_head_dim + v_head_dim)
+        kv_projected_flat = self.W_kv_proj(kv_nope_flat)  # [batch*num_heads*seq, qk_nope_head_dim + v_head_dim]
+
+        # 重塑回多头格式
+        kv_projected = kv_projected_flat.view(batch_size, self.num_heads, seq_len, -1)
+
+        # Split K_nope 和 V
+        k_nope = kv_projected[:, :, :, :self.qk_nope_head_dim]  # [batch, num_heads, seq, qk_nope_head_dim]
+        v = kv_projected[:, :, :, self.qk_nope_head_dim:]  # [batch, num_heads, seq, v_head_dim]
+
+        # ===== 应用 RoPE =====
+        # RoPE 应用到 q_pe 和 k_pe
+        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, self.freqs_cos[:seq_len], self.freqs_sin[:seq_len])
+
+        # ===== 拼接 Q 和 K =====
+        q = torch.cat([q_nope, q_pe], dim=-1)  # [batch, num_heads, seq, qk_nope + qk_pe]
+        k = torch.cat([k_nope, k_pe], dim=-1)  # [batch, num_heads, seq, qk_nope + qk_pe]
+
+        # ===== 注意力计算 =====
+        scale = 1.0 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
 
         # 应用因果掩码（上三角矩阵）
@@ -293,7 +317,7 @@ class MultiheadLatentAttentionV3_2(nn.Module):
         attn_probs = self.attn_dropout(attn_probs)
 
         # 计算输出
-        attn_output = torch.matmul(attn_probs, v)  # [batch, num_heads, seq, d_v]
+        attn_output = torch.matmul(attn_probs, v)  # [batch, num_heads, seq, v_head_dim]
 
         # ===== NSA 稀疏注意力补充计算 =====
         if self.use_nsa and self.indexer is not None:
@@ -320,8 +344,8 @@ class MultiheadLatentAttentionV3_2(nn.Module):
             # 扩展到序列维度
             index_output = index_output.unsqueeze(2).expand(-1, -1, seq_len, -1)  # [batch, index_n_heads, seq, hidden_size]
 
-            # 截取前 d_v 维度
-            index_output = index_output[:, :, :, :self.d_v]  # [batch, index_n_heads, seq, d_v]
+            # 截取前 v_head_dim 维度
+            index_output = index_output[:, :, :, :self.v_head_dim]  # [batch, index_n_heads, seq, v_head_dim]
 
             # 扩展 index_n_heads 到 num_heads (如果不同)
             if self.index_n_heads < self.num_heads:
@@ -335,7 +359,9 @@ class MultiheadLatentAttentionV3_2(nn.Module):
             # 残差连接
             attn_output = attn_output + index_output
 
+        # ===== 输出投影 =====
         # 拼接所有头并投影
+        # attn_output: [batch, num_heads, seq, v_head_dim]
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         output = self.o_proj(attn_output)
         return self.resid_dropout(output)

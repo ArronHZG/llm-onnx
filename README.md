@@ -142,6 +142,8 @@ python -m visualization.positional_encoding_visualization
 
 > https://github.com/sustcsonglin/linear-attention-and-beyond-slides
 
+> 高清大图: https://github.com/CalvinXKY/InfraTech/tree/main 
+
 ## License
 
 MIT License
