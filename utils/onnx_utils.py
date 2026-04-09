@@ -1,6 +1,7 @@
 """
 ONNX工具函数：导出和简化PyTorch模型
 """
+
 import logging
 from typing import Optional, Tuple, Dict
 
@@ -134,7 +135,7 @@ def simplify_onnx(
             model,
             skipped_optimizers=skipped_optimizers,
             # 告诉 onnxsim 不要因为无法验证自定义算子而失败
-            include_subgraph=True
+            include_subgraph=True,
         )
     except Exception as e:
         logger.error(f"ONNX模型简化失败: {e}")
@@ -179,7 +180,9 @@ def export_and_simplify(
     # 简化模型（如果启用）
     if simplify:
         sim_path = onnx_path.replace(".onnx", "_sim.onnx")
-        simplified = simplify_onnx(onnx_path, sim_path, skipped_optimizers=skipped_optimizers)
+        simplified = simplify_onnx(
+            onnx_path, sim_path, skipped_optimizers=skipped_optimizers
+        )
         if simplified is not None:
             return simplified
 
@@ -192,6 +195,7 @@ def validate_onnx(onnx_path: str) -> bool:
     """
     try:
         import onnx
+
         model = onnx.load(onnx_path)
         logger.info(f"ONNX模型加载成功: {onnx_path}")
         return True

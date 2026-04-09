@@ -1,6 +1,7 @@
 """
 GPT Transformer模型实现（带绝对位置嵌入）
 """
+
 import math
 import os
 
@@ -15,7 +16,9 @@ from visualization.positional_encoding_visualization import PositionalEncoding
 class MultiHeadAttention(nn.Module):
     """多头注意力"""
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, max_seq_len=1024):
+    def __init__(
+        self, d_model: int, n_heads: int, dropout: float = 0.1, max_seq_len=1024
+    ):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
 
@@ -34,7 +37,7 @@ class MultiHeadAttention(nn.Module):
         # 注册因果掩码缓冲区（上三角矩阵，对角线以上为1，表示需要mask的位置）
         # mask形状: [seq_len, seq_len]
         mask = torch.triu(torch.ones(max_seq_len, max_seq_len), diagonal=1)
-        self.register_buffer('causal_mask', mask, persistent=False)
+        self.register_buffer("causal_mask", mask, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -56,7 +59,9 @@ class MultiHeadAttention(nn.Module):
 
         # 应用因果掩码（上三角矩阵）
         # 扩展mask维度以匹配多头注意力: [1, 1, seq_len, seq_len]
-        mask_expanded = self.causal_mask[:n_tokens, :n_tokens].view(1, 1, n_tokens, n_tokens)
+        mask_expanded = self.causal_mask[:n_tokens, :n_tokens].view(
+            1, 1, n_tokens, n_tokens
+        )
         attn_scores.masked_fill_(mask_expanded.bool(), -torch.inf)
 
         # 注意力权重和输出
@@ -133,6 +138,7 @@ class GPTTransformerBlock(nn.Module):
 
         return x
 
+
 class GPTTransformer(nn.Module):
     """完整的GPT Transformer模型"""
 
@@ -154,10 +160,12 @@ class GPTTransformer(nn.Module):
         # 词嵌入dropout
         self.drop_emb = nn.Dropout(dropout)
         # Transformer层堆叠
-        self.layers = nn.ModuleList([
-            GPTTransformerBlock(d_model, n_heads, d_ff, dropout)
-            for _ in range(n_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                GPTTransformerBlock(d_model, n_heads, d_ff, dropout)
+                for _ in range(n_layers)
+            ]
+        )
         # 最终层归一化
         self.ln_f = nn.LayerNorm(d_model)
         # 输出层
@@ -229,13 +237,13 @@ if __name__ == "__main__":
         dummy_input=dummy_input,
         onnx_path=onnx_path,
         simplify=True,
-        input_names=['input_ids'],
-        output_names=['logits'],
+        input_names=["input_ids"],
+        output_names=["logits"],
         # dynamic_axes={
         #     'input_ids': {0: 'batch_size', 1: 'seq_len'},
         #     'logits': {0: 'batch_size', 1: 'seq_len'}
         # },
-        skipped_optimizers=['FuseMatMul'],
+        skipped_optimizers=["FuseMatMul"],
     )
 
     # 验证ONNX模型

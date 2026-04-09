@@ -16,6 +16,7 @@ GPT Transformer with Mixture of Experts (MoE) 实现
 - 包含门控机制决定token->expert的路由
 - 可大幅增加模型容量同时保持推理成本可控
 """
+
 import math
 import os
 
@@ -53,7 +54,7 @@ class MoEGate(nn.Module):
         hidden_size: int,
         n_routed_experts: int,
         num_experts_per_tok: int = 2,
-        scoring_func: str = 'softmax',
+        scoring_func: str = "softmax",
         aux_loss_alpha: float = 0.01,
         seq_aux: bool = True,
         norm_topk_prob: bool = True,
@@ -80,7 +81,9 @@ class MoEGate(nn.Module):
         # 门控权重: [n_routed_experts, hidden_size]
         # 输入: hidden_size维的向量
         # 输出: n_routed_experts维的logits
-        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.hidden_size)))
+        self.weight = nn.Parameter(
+            torch.empty((self.n_routed_experts, self.hidden_size))
+        )
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -108,15 +111,19 @@ class MoEGate(nn.Module):
         logits = F.linear(hidden_states, self.weight, None)
 
         # Softmax转换为概率分布
-        if self.scoring_func == 'softmax':
+        if self.scoring_func == "softmax":
             scores = logits.softmax(dim=-1)
         else:
-            raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
+            raise NotImplementedError(
+                f"insupportable scoring function for MoE gating: {self.scoring_func}"
+            )
 
         # 选择top-k专家
         # topk_weight: 每个token对选中专家的得分
         # topk_idx: 每个token选中的专家索引
-        topk_weight, topk_idx = torch.topk(scores, k=self.num_experts_per_tok, dim=-1, sorted=False)
+        topk_weight, topk_idx = torch.topk(
+            scores, k=self.num_experts_per_tok, dim=-1, sorted=False
+        )
 
         # 对top-k概率进行归一化
         # 使得所有被选中专家的权重之和为1
@@ -134,16 +141,24 @@ class MoEGate(nn.Module):
             if self.seq_aux:
                 # 按序列维度计算: 考虑序列中所有token的专家分布
                 scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
-                ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
+                ce = torch.zeros(
+                    bsz, self.n_routed_experts, device=hidden_states.device
+                )
                 # 统计每个batch中每个专家被选中的次数
-                ce.scatter_add_(1, topk_idx_for_aux_loss,
-                                torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
-                    seq_len * aux_topk / self.n_routed_experts)
+                ce.scatter_add_(
+                    1,
+                    topk_idx_for_aux_loss,
+                    torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device),
+                ).div_(seq_len * aux_topk / self.n_routed_experts)
                 # 计算辅助损失
-                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.aux_loss_alpha
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(
+                    dim=1
+                ).mean() * self.aux_loss_alpha
             else:
                 # 不按序列维度计算: 将所有token视为独立
-                mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
+                mask_ce = F.one_hot(
+                    topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts
+                )
                 ce = mask_ce.float().mean(0)  # 专家使用频率
                 Pi = scores_for_aux.mean(0)  # 专家得分均值
                 fi = ce * self.n_routed_experts  # 负载因子
@@ -176,7 +191,7 @@ class MOEFeedForward(nn.Module):
         n_shared_experts: int = 1,
         num_experts_per_tok: int = 2,
         dropout: float = 0.1,
-        scoring_func: str = 'softmax',
+        scoring_func: str = "softmax",
         aux_loss_alpha: float = 0.01,
         seq_aux: bool = True,
         norm_topk_prob: bool = True,
@@ -203,10 +218,9 @@ class MOEFeedForward(nn.Module):
         self.dropout = dropout
 
         # 路由专家: 根据门控决策动态选择激活
-        self.experts = nn.ModuleList([
-            FeedForward(d_model, d_ff, dropout)
-            for _ in range(n_routed_experts)
-        ])
+        self.experts = nn.ModuleList(
+            [FeedForward(d_model, d_ff, dropout) for _ in range(n_routed_experts)]
+        )
 
         # 门控机制: 决定token->expert的路由
         self.gate = MoEGate(
@@ -222,10 +236,9 @@ class MOEFeedForward(nn.Module):
         # 共享专家: 始终激活的FFN，不经过门控选择
         # 作用: 提供基础的表达能力，防止某些token完全不被路由
         if n_shared_experts > 0:
-            self.shared_experts = nn.ModuleList([
-                FeedForward(d_model, d_ff, dropout)
-                for _ in range(n_shared_experts)
-            ])
+            self.shared_experts = nn.ModuleList(
+                [FeedForward(d_model, d_ff, dropout) for _ in range(n_shared_experts)]
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -261,14 +274,18 @@ class MOEFeedForward(nn.Module):
                     y[flat_topk_idx == i] = expert_out.to(y.dtype)
                 else:
                     # 空tensor时保持梯度流
-                    y[flat_topk_idx == i] = expert_out.to(y.dtype) + 0 * sum(p.sum() for p in expert.parameters())
+                    y[flat_topk_idx == i] = expert_out.to(y.dtype) + 0 * sum(
+                        p.sum() for p in expert.parameters()
+                    )
 
             # 重新reshape并加权求和
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
             y = y.view(*orig_shape)
         else:
             # 推理时: 使用优化的推理方法
-            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
+            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(
+                *orig_shape
+            )
 
         # ===== 共享专家计算 =====
         # 共享专家始终激活，与路由专家的输出相加
@@ -285,7 +302,7 @@ class MOEFeedForward(nn.Module):
         self,
         x: torch.Tensor,
         flat_expert_indices: torch.Tensor,
-        flat_expert_weights: torch.Tensor
+        flat_expert_weights: torch.Tensor,
     ) -> torch.Tensor:
         """
         优化的推理方法
@@ -329,7 +346,9 @@ class MOEFeedForward(nn.Module):
             expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
 
             # 累加到输出
-            expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out)
+            expert_cache.scatter_add_(
+                0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out
+            )
 
         return expert_cache
 
@@ -360,7 +379,7 @@ class GPTTransformerBlockWithMoE(nn.Module):
         n_shared_experts: int = 1,
         num_experts_per_tok: int = 2,
         use_moe: bool = True,
-        scoring_func: str = 'softmax',
+        scoring_func: str = "softmax",
         aux_loss_alpha: float = 0.01,
         seq_aux: bool = True,
         norm_topk_prob: bool = True,
@@ -461,7 +480,7 @@ class GPTTransformerWithMoE(nn.Module):
         n_routed_experts: int = 4,
         n_shared_experts: int = 1,
         num_experts_per_tok: int = 2,
-        scoring_func: str = 'softmax',
+        scoring_func: str = "softmax",
         aux_loss_alpha: float = 0.01,
         seq_aux: bool = True,
         norm_topk_prob: bool = True,
@@ -492,24 +511,26 @@ class GPTTransformerWithMoE(nn.Module):
         self.drop_emb = nn.Dropout(dropout)
 
         # Transformer层堆叠
-        self.layers = nn.ModuleList([
-            GPTTransformerBlockWithMoE(
-                d_model=d_model,
-                n_heads=n_heads,
-                d_ff=d_ff,
-                dropout=dropout,
-                n_routed_experts=n_routed_experts,
-                n_shared_experts=n_shared_experts,
-                num_experts_per_tok=num_experts_per_tok,
-                use_moe=use_moe,
-                scoring_func=scoring_func,
-                aux_loss_alpha=aux_loss_alpha,
-                seq_aux=seq_aux,
-                norm_topk_prob=norm_topk_prob,
-                max_seq_len=max_seq_len,
-            )
-            for _ in range(n_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                GPTTransformerBlockWithMoE(
+                    d_model=d_model,
+                    n_heads=n_heads,
+                    d_ff=d_ff,
+                    dropout=dropout,
+                    n_routed_experts=n_routed_experts,
+                    n_shared_experts=n_shared_experts,
+                    num_experts_per_tok=num_experts_per_tok,
+                    use_moe=use_moe,
+                    scoring_func=scoring_func,
+                    aux_loss_alpha=aux_loss_alpha,
+                    seq_aux=seq_aux,
+                    norm_topk_prob=norm_topk_prob,
+                    max_seq_len=max_seq_len,
+                )
+                for _ in range(n_layers)
+            ]
+        )
 
         # 最终层归一化
         self.ln_f = nn.LayerNorm(d_model)
@@ -601,9 +622,9 @@ if __name__ == "__main__":
         dummy_input=dummy_input,
         onnx_path=onnx_path,
         simplify=True,
-        input_names=['input_ids'],
-        output_names=['logits'],
-        skipped_optimizers=['FuseMatMul'],
+        input_names=["input_ids"],
+        output_names=["logits"],
+        skipped_optimizers=["FuseMatMul"],
     )
 
     # 验证ONNX模型

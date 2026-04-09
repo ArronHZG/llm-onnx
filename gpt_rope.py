@@ -1,6 +1,7 @@
 """
 GPT Transformer with Rotary Position Embedding (RoPE) 实现
 """
+
 import math
 import os
 from typing import Optional
@@ -66,7 +67,14 @@ def apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin):
 class MultiHeadAttentionWithRoPE(nn.Module):
     """带RoPE的多头注意力"""
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, rope_base: float = 10000.0, max_seq_len=1024):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        dropout: float = 0.1,
+        rope_base: float = 10000.0,
+        max_seq_len=1024,
+    ):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
 
@@ -85,20 +93,20 @@ class MultiHeadAttentionWithRoPE(nn.Module):
 
         # 预计算的位置编码缓冲区
         freqs_cos, freqs_sin = precompute_freqs_cis(
-            dim=self.d_k,
-            end=max_seq_len,
-            rope_base=self.rope_base
+            dim=self.d_k, end=max_seq_len, rope_base=self.rope_base
         )
 
-        self.register_buffer('freqs_cos', freqs_cos, persistent=False)
-        self.register_buffer('freqs_sin', freqs_sin, persistent=False)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
         # 注册因果掩码缓冲区（上三角矩阵，对角线以上为1，表示需要mask的位置）
         # mask形状: [seq_len, seq_len]
         mask = torch.triu(torch.ones(max_seq_len, max_seq_len), diagonal=1)
-        self.register_buffer('causal_mask', mask, persistent=False)
+        self.register_buffer("causal_mask", mask, persistent=False)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         前向传播
         Args:
@@ -113,21 +121,35 @@ class MultiHeadAttentionWithRoPE(nn.Module):
         batch_size, seq_len, _ = x.shape  # b = batch_size, n_tokens = seq_len
 
         # 线性投影并拆分多头: [batch_size, seq_len, n_heads, d_k]
-        q = self.w_q(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
-        k = self.w_k(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
-        v = self.w_v(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        q = (
+            self.w_q(x)
+            .view(batch_size, seq_len, self.n_heads, self.d_k)
+            .transpose(1, 2)
+        )
+        k = (
+            self.w_k(x)
+            .view(batch_size, seq_len, self.n_heads, self.d_k)
+            .transpose(1, 2)
+        )
+        v = (
+            self.w_v(x)
+            .view(batch_size, seq_len, self.n_heads, self.d_k)
+            .transpose(1, 2)
+        )
 
         # 应用旋转位置编码
-        q_rot, k_rot = apply_rotary_pos_emb(q, k,
-                                           self.freqs_cos[:seq_len],
-                                           self.freqs_sin[:seq_len])
+        q_rot, k_rot = apply_rotary_pos_emb(
+            q, k, self.freqs_cos[:seq_len], self.freqs_sin[:seq_len]
+        )
 
         # 注意力计算: [batch_size, n_heads, seq_len, seq_len]
         attn_scores = torch.matmul(q_rot, k_rot.transpose(-2, -1)) / math.sqrt(self.d_k)
 
         # 应用因果掩码（上三角矩阵）
         # 扩展mask维度以匹配多头注意力: [1, 1, seq_len, seq_len]
-        mask_expanded = self.causal_mask[:seq_len, :seq_len].view(1, 1, seq_len, seq_len)
+        mask_expanded = self.causal_mask[:seq_len, :seq_len].view(
+            1, 1, seq_len, seq_len
+        )
         attn_scores.masked_fill_(mask_expanded.bool(), -torch.inf)
 
         # 注意力权重和输出
@@ -200,10 +222,12 @@ class GPTTransformerWithRoPE(nn.Module):
         # 词嵌入dropout
         self.drop_emb = nn.Dropout(dropout)
         # Transformer层堆叠
-        self.layers = nn.ModuleList([
-            GPTTransformerBlockWithRoPE(d_model, n_heads, d_ff, dropout)
-            for _ in range(n_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                GPTTransformerBlockWithRoPE(d_model, n_heads, d_ff, dropout)
+                for _ in range(n_layers)
+            ]
+        )
         # 最终层归一化
         self.ln_f = nn.LayerNorm(d_model)
         # 输出层
@@ -280,9 +304,9 @@ if __name__ == "__main__":
         dummy_input=dummy_input,
         onnx_path=onnx_path,
         simplify=True,
-        input_names=['input_ids'],
-        output_names=['logits'],
-        skipped_optimizers=['FuseMatMul'],
+        input_names=["input_ids"],
+        output_names=["logits"],
+        skipped_optimizers=["FuseMatMul"],
     )
 
     # 验证ONNX模型

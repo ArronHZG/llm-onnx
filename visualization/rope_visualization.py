@@ -12,17 +12,19 @@ class RoPE(torch.nn.Module):
         # 预计算频率项（与SinPE完全一致）
         inv_freq = 1.0 / (10000 ** (torch.arange(0, d_model, 2).float() / d_model))
         print(f"inv_freq: {inv_freq.shape}")
-        self.register_buffer('inv_freq', inv_freq, persistent=False)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
         # 预计算位置（0到max_len-1）
         positions = torch.arange(max_len, dtype=torch.float)
-        self.register_buffer('positions', positions, persistent=False)
+        self.register_buffer("positions", positions, persistent=False)
 
     def _compute_rotary_emb(self, seq_len: int):
         """Compute sin and cos values for rotation"""
         # 截取当前序列长度的位置
         positions = self.positions[:seq_len].unsqueeze(1)  # (seq_len, 1)
         # 计算旋转角度：n * theta_m
-        freqs = torch.matmul(positions, self.inv_freq.unsqueeze(0))  # (seq_len, d_model//2)
+        freqs = torch.matmul(
+            positions, self.inv_freq.unsqueeze(0)
+        )  # (seq_len, d_model//2)
         # 直接返回sin和cos，形状为 (seq_len, d_model//2)
         sin = torch.sin(freqs)  # (seq_len, d_model//2)
         cos = torch.cos(freqs)  # (seq_len, d_model//2)
@@ -83,23 +85,52 @@ def visualize_rope(d_model: int = 64, seq_len: int = 50):
     sin_emb_np = sin_emb.squeeze(0).detach().numpy()
 
     # 设置画布，4个子图展示核心信息
-    plt.rcParams['figure.figsize'] = (20, 16)
+    plt.rcParams["figure.figsize"] = (20, 16)
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2)
 
     # Subplot 1: Vector rotation effect at a single position (position 10), using first 2 dimensions for intuitive display
     pos_idx = 10  # 选择第10个位置
-    ax1.scatter(embedding_np[pos_idx, 0], embedding_np[pos_idx, 1],
-                color='blue', label='Before rotation (original embedding)', s=80)
-    ax1.scatter(rope_emb_np[pos_idx, 0], rope_emb_np[pos_idx, 1],
-                color='red', label='After rotation (RoPE)', s=80)
+    ax1.scatter(
+        embedding_np[pos_idx, 0],
+        embedding_np[pos_idx, 1],
+        color="blue",
+        label="Before rotation (original embedding)",
+        s=80,
+    )
+    ax1.scatter(
+        rope_emb_np[pos_idx, 0],
+        rope_emb_np[pos_idx, 1],
+        color="red",
+        label="After rotation (RoPE)",
+        s=80,
+    )
     # 绘制旋转角度示意线
-    ax1.arrow(0, 0, embedding_np[pos_idx, 0], embedding_np[pos_idx, 1],
-              color='blue', linestyle='--', alpha=0.5, label='Before rotation vector')
-    ax1.arrow(0, 0, rope_emb_np[pos_idx, 0], rope_emb_np[pos_idx, 1],
-              color='red', linestyle='--', alpha=0.5, label='After rotation vector')
-    ax1.set_title(f'Vector rotation effect at position {pos_idx} (first 2 dimensions)', fontsize=14)
-    ax1.set_xlabel('Dimension 0', fontsize=12)
-    ax1.set_ylabel('Dimension 1', fontsize=12)
+    ax1.arrow(
+        0,
+        0,
+        embedding_np[pos_idx, 0],
+        embedding_np[pos_idx, 1],
+        color="blue",
+        linestyle="--",
+        alpha=0.5,
+        label="Before rotation vector",
+    )
+    ax1.arrow(
+        0,
+        0,
+        rope_emb_np[pos_idx, 0],
+        rope_emb_np[pos_idx, 1],
+        color="red",
+        linestyle="--",
+        alpha=0.5,
+        label="After rotation vector",
+    )
+    ax1.set_title(
+        f"Vector rotation effect at position {pos_idx} (first 2 dimensions)",
+        fontsize=14,
+    )
+    ax1.set_xlabel("Dimension 0", fontsize=12)
+    ax1.set_ylabel("Dimension 1", fontsize=12)
     ax1.legend(fontsize=10)
     ax1.grid(True, alpha=0.3)
     # 设置坐标轴范围，使原点(0,0)居中，且x轴和y轴长度相同
@@ -111,38 +142,63 @@ def visualize_rope(d_model: int = 64, seq_len: int = 50):
     limit = max(max_abs_x, max_abs_y) * (1 + margin)  # 使用最大值确保x轴和y轴等长
     ax1.set_xlim(-limit, limit)
     ax1.set_ylim(-limit, limit)
-    ax1.set_aspect('equal', adjustable='box')
+    ax1.set_aspect("equal", adjustable="box")
 
     # Subplot 2: RoPE rotation angle heatmap (position × dimension)
     # Rotation angle = arctan2(sin, cos), reflecting rotation degree at different positions and dimensions
-    rot_angle = np.arctan2(sin_rope.squeeze(0).detach().numpy(), cos_rope.squeeze(0).detach().numpy())
-    im2 = ax2.imshow(rot_angle, cmap='hsv', aspect='equal')
-    ax2.set_title(f'RoPE rotation angle heatmap (d_model={d_model}, seq_len={seq_len})', fontsize=14)
-    ax2.set_xlabel('Dimension (d_model)', fontsize=12)
-    ax2.set_ylabel('Position (seq_len)', fontsize=12)
+    rot_angle = np.arctan2(
+        sin_rope.squeeze(0).detach().numpy(), cos_rope.squeeze(0).detach().numpy()
+    )
+    im2 = ax2.imshow(rot_angle, cmap="hsv", aspect="equal")
+    ax2.set_title(
+        f"RoPE rotation angle heatmap (d_model={d_model}, seq_len={seq_len})",
+        fontsize=14,
+    )
+    ax2.set_xlabel("Dimension (d_model)", fontsize=12)
+    ax2.set_ylabel("Position (seq_len)", fontsize=12)
     cbar2 = plt.colorbar(im2, ax=ax2)
-    cbar2.set_label('Rotation angle (radians)', fontsize=10)
+    cbar2.set_label("Rotation angle (radians)", fontsize=10)
 
     # Subplot 3: Vector distribution comparison between RoPE and SinPE (positions 0~20, first 2 dimensions)
     for i in range(20):
-        ax3.scatter(rope_emb_np[i, 0], rope_emb_np[i, 1], color='red', alpha=0.6, label='RoPE' if i == 0 else "")
-        ax3.scatter(sin_emb_np[i, 0], sin_emb_np[i, 1], color='blue', alpha=0.6, label='SinPE' if i == 0 else "")
-    ax3.set_title('Vector distribution comparison: RoPE vs SinPE (first 20 positions, first 2 dimensions)', fontsize=14)
-    ax3.set_xlabel('Dimension 0', fontsize=12)
-    ax3.set_ylabel('Dimension 1', fontsize=12)
+        ax3.scatter(
+            rope_emb_np[i, 0],
+            rope_emb_np[i, 1],
+            color="red",
+            alpha=0.6,
+            label="RoPE" if i == 0 else "",
+        )
+        ax3.scatter(
+            sin_emb_np[i, 0],
+            sin_emb_np[i, 1],
+            color="blue",
+            alpha=0.6,
+            label="SinPE" if i == 0 else "",
+        )
+    ax3.set_title(
+        "Vector distribution comparison: RoPE vs SinPE (first 20 positions, first 2 dimensions)",
+        fontsize=14,
+    )
+    ax3.set_xlabel("Dimension 0", fontsize=12)
+    ax3.set_ylabel("Dimension 1", fontsize=12)
     ax3.legend(fontsize=10)
     ax3.grid(True, alpha=0.3)
-    ax3.set_aspect('equal', adjustable='box')
+    ax3.set_aspect("equal", adjustable="box")
 
     # Subplot 4: sin value variation of first 8 dimensions in RoPE (showing frequency characteristics, consistent with SinPE)
     positions = np.arange(seq_len)
     for i in [0, 31, 63]:
-        ax4.plot(positions, sin_rope.squeeze(0).detach().numpy()[:, i], label=f'Dimension {i}')
+        ax4.plot(
+            positions,
+            sin_rope.squeeze(0).detach().numpy()[:, i],
+            label=f"Dimension {i}",
+        )
     ax4.set_title(
-        'sin value variation of first 8 dimensions in RoPE (showing frequency differences, consistent with SinPE)',
-        fontsize=14)
-    ax4.set_xlabel('Position', fontsize=12)
-    ax4.set_ylabel('sin value (related to rotation angle)', fontsize=12)
+        "sin value variation of first 8 dimensions in RoPE (showing frequency differences, consistent with SinPE)",
+        fontsize=14,
+    )
+    ax4.set_xlabel("Position", fontsize=12)
+    ax4.set_ylabel("sin value (related to rotation angle)", fontsize=12)
     ax4.legend(fontsize=10)
     ax4.grid(True, alpha=0.3)
 
@@ -150,8 +206,9 @@ def visualize_rope(d_model: int = 64, seq_len: int = 50):
     plt.tight_layout()
     # 保存图片到image目录
     import os
-    os.makedirs('image', exist_ok=True)
-    plt.savefig('image/rope_visualization.png', dpi=300, bbox_inches='tight')
+
+    os.makedirs("image", exist_ok=True)
+    plt.savefig("image/rope_visualization.png", dpi=300, bbox_inches="tight")
     # 显示图片
     plt.show()
 

@@ -1,0 +1,62 @@
+U# Ray 运行时环境忽略文件
+# 这些文件/目录不会被上传到 Ray 集群
+
+# 大文件目录
+image/
+onnx_data/
+
+# 第三方库
+flash-linear-attention/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 日志和临时文件
+*.log
+*.tmp
+.DS_Store
+
+# 数据和模型文件（通常很大）
+*.onnx
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+data/
+datasets/
+checkpoints/
+outputs/
+wandb/
+
+# Git
+.git/
+.gitignore
+
+# 其他
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+

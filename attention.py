@@ -1,6 +1,7 @@
 """
 注意力机制实现：自注意力和多头注意力
 """
+
 from typing import Optional
 
 import torch
@@ -32,7 +33,9 @@ class SelfAttention(nn.Module):
         # 输出线性变换
         self.W_o = nn.Linear(d_model, d_model)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         前向传播
 
@@ -57,11 +60,11 @@ class SelfAttention(nn.Module):
         V = V.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
 
         # 计算注意力分数: Q * K^T / sqrt(d_k)
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.d_k ** 0.5)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.d_k**0.5)
 
         # 应用掩码（如果有）
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
+            scores = scores.masked_fill(mask == 0, float("-inf"))
 
         # 计算注意力权重
         attn_weights = F.softmax(scores, dim=-1)
@@ -71,7 +74,11 @@ class SelfAttention(nn.Module):
 
         # 合并多个头的结果
         # shape: (batch_size, seq_len, d_model)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        attn_output = (
+            attn_output.transpose(1, 2)
+            .contiguous()
+            .view(batch_size, seq_len, self.d_model)
+        )
 
         # 输出线性变换
         output = self.W_o(attn_output)
@@ -91,7 +98,9 @@ class MultiHeadAttention(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         # 自注意力
         output = self.attention(x, mask)
         # 残差连接和层归一化
@@ -115,4 +124,3 @@ if __name__ == "__main__":
     print(f"输入 shape: {x.shape}")
     print(f"输出 shape: {output.shape}")
     print("注意力机制测试通过！")
-

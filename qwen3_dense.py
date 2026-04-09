@@ -9,6 +9,7 @@ Qwen3 Dense 模型实现
 - SwiGLU激活函数
 - QK归一化
 """
+
 import math
 import os
 
@@ -91,13 +92,13 @@ class Qwen3Attention(nn.Module):
     """
 
     def __init__(
-            self,
-            hidden_size: int,
-            num_heads: int,
-            num_kv_heads: int,
-            dropout: float = 0.0,
-            rope_base: float = 1000000.0,
-            max_seq_len: int = 1024,
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        dropout: float = 0.0,
+        rope_base: float = 1000000.0,
+        max_seq_len: int = 1024,
     ):
         super().__init__()
         assert hidden_size % num_heads == 0
@@ -114,9 +115,7 @@ class Qwen3Attention(nn.Module):
         # K: num_kv_heads * head_dim
         # V: num_kv_heads * head_dim
         self.qkv_proj = nn.Linear(
-            hidden_size,
-            (num_heads + 2 * num_kv_heads) * self.head_dim,
-            bias=False
+            hidden_size, (num_heads + 2 * num_kv_heads) * self.head_dim, bias=False
         )
 
         # O投影: 将多头注意力的输出映射回hidden_size
@@ -131,18 +130,16 @@ class Qwen3Attention(nn.Module):
 
         # RoPE预计算: 预先计算cos和sin值，避免重复计算
         freqs_cos, freqs_sin = precompute_freqs_cis(
-            dim=self.head_dim,
-            end=max_seq_len,
-            rope_base=rope_base
+            dim=self.head_dim, end=max_seq_len, rope_base=rope_base
         )
-        self.register_buffer('freqs_cos', freqs_cos, persistent=False)
-        self.register_buffer('freqs_sin', freqs_sin, persistent=False)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
         # 因果掩码: 上三角矩阵，确保attention只能看到当前位置之前的token
         # mask[i,j] = 1 表示位置i可以看到位置j (j <= i)
         # 注册为buffer，ONNX导出时会作为常量
         mask = torch.triu(torch.ones(max_seq_len, max_seq_len), diagonal=1)
-        self.register_buffer('causal_mask', mask, persistent=False)
+        self.register_buffer("causal_mask", mask, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -164,8 +161,12 @@ class Qwen3Attention(nn.Module):
 
         # 3. Reshape: [batch_size, seq_len, num_heads, head_dim] -> [batch_size, num_heads, seq_len, head_dim]
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(
+            1, 2
+        )
+        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(
+            1, 2
+        )
 
         # 4. QK归一化 (Qwen3特色)
         q = self.q_norm(q)
@@ -173,9 +174,10 @@ class Qwen3Attention(nn.Module):
 
         # 5. 应用RoPE旋转位置编码
         q, k = apply_rotary_pos_emb(
-            q, k,
+            q,
+            k,
             self.freqs_cos[:seq_len],  # 只取当前序列长度的cos
-            self.freqs_sin[:seq_len]  # 只取当前序列长度的sin
+            self.freqs_sin[:seq_len],  # 只取当前序列长度的sin
         )
 
         # 6. GQA: 如果KV头数少于Q头数，复制K和V以匹配Q头数
@@ -189,7 +191,9 @@ class Qwen3Attention(nn.Module):
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
         # 8. 因果掩码: 屏蔽未来位置的信息
-        mask_expanded = self.causal_mask[:seq_len, :seq_len].view(1, 1, seq_len, seq_len)
+        mask_expanded = self.causal_mask[:seq_len, :seq_len].view(
+            1, 1, seq_len, seq_len
+        )
         attn_scores.masked_fill_(mask_expanded.bool(), -torch.inf)
 
         # 9. Softmax和Dropout
@@ -201,7 +205,9 @@ class Qwen3Attention(nn.Module):
 
         # 11. 恢复形状: [batch_size, num_heads, seq_len, head_dim] -> [batch_size, seq_len, hidden_size]
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(batch_size, seq_len, self.num_heads * self.head_dim)
+        attn_output = attn_output.view(
+            batch_size, seq_len, self.num_heads * self.head_dim
+        )
 
         # 12. O投影
         output = self.o_proj(attn_output)
@@ -212,14 +218,14 @@ class Qwen3DecoderLayer(nn.Module):
     """Qwen3 Decoder层"""
 
     def __init__(
-            self,
-            hidden_size: int,
-            num_heads: int,
-            num_kv_heads: int,
-            intermediate_size: int,
-            dropout: float = 0.0,
-            rope_base: float = 1000000.0,
-            max_seq_len: int = 1024,
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        intermediate_size: int,
+        dropout: float = 0.0,
+        rope_base: float = 1000000.0,
+        max_seq_len: int = 1024,
     ):
         super().__init__()
         # Pre-LN结构
@@ -261,16 +267,16 @@ class Qwen3DenseModel(nn.Module):
     """Qwen3 Dense模型"""
 
     def __init__(
-            self,
-            vocab_size: int,
-            hidden_size: int = 768,
-            num_attention_heads: int = 12,
-            num_key_value_heads: int = 2,  # GQA: KV头数可以少于Q头数
-            num_hidden_layers: int = 1,
-            intermediate_size: int = 2048,
-            dropout: float = 0.0,
-            rope_base: float = 1000000.0,
-            max_position_embeddings: int = 1024,
+        self,
+        vocab_size: int,
+        hidden_size: int = 768,
+        num_attention_heads: int = 12,
+        num_key_value_heads: int = 2,  # GQA: KV头数可以少于Q头数
+        num_hidden_layers: int = 1,
+        intermediate_size: int = 2048,
+        dropout: float = 0.0,
+        rope_base: float = 1000000.0,
+        max_position_embeddings: int = 1024,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -281,18 +287,20 @@ class Qwen3DenseModel(nn.Module):
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
 
         # Transformer层
-        self.layers = nn.ModuleList([
-            Qwen3DecoderLayer(
-                hidden_size=hidden_size,
-                num_heads=num_attention_heads,
-                num_kv_heads=num_key_value_heads,
-                intermediate_size=intermediate_size,
-                dropout=dropout,
-                rope_base=rope_base,
-                max_seq_len=max_position_embeddings,
-            )
-            for _ in range(num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                Qwen3DecoderLayer(
+                    hidden_size=hidden_size,
+                    num_heads=num_attention_heads,
+                    num_kv_heads=num_key_value_heads,
+                    intermediate_size=intermediate_size,
+                    dropout=dropout,
+                    rope_base=rope_base,
+                    max_seq_len=max_position_embeddings,
+                )
+                for _ in range(num_hidden_layers)
+            ]
+        )
 
         # 最终归一化
         self.norm = torch.nn.LayerNorm(hidden_size)
@@ -353,9 +361,9 @@ if __name__ == "__main__":
         dummy_input=dummy_input,
         onnx_path=onnx_path,
         simplify=True,
-        input_names=['input_ids'],
-        output_names=['logits'],
-        skipped_optimizers=['FuseMatMul'],
+        input_names=["input_ids"],
+        output_names=["logits"],
+        skipped_optimizers=["FuseMatMul"],
     )
 
     # 验证ONNX模型

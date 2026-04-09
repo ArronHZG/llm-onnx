@@ -67,16 +67,16 @@ class MultiheadLatentAttention(nn.Module):
     """
 
     def __init__(
-            self,
-            hidden_size: int,
-            num_heads: int,
-            q_lora_rank: int = 1536,
-            kv_lora_rank: int = 512,
-            qk_nope_head_dim: int = 128,
-            qk_rope_head_dim: int = 64,
-            v_head_dim: int = 128,
-            max_seq_len: int = 2048,
-            dropout: float = 0.0,
+        self,
+        hidden_size: int,
+        num_heads: int,
+        q_lora_rank: int = 1536,
+        kv_lora_rank: int = 512,
+        qk_nope_head_dim: int = 128,
+        qk_rope_head_dim: int = 64,
+        v_head_dim: int = 128,
+        max_seq_len: int = 2048,
+        dropout: float = 0.0,
     ):
         super().__init__()
 
@@ -95,15 +95,21 @@ class MultiheadLatentAttention(nn.Module):
         # Q RMSNorm
         self.q_norm = RMSNorm(q_lora_rank)
         # Q 上采样: q_lora_rank -> num_heads * (qk_nope_head_dim + qk_rope_head_dim)
-        self.W_q_proj = nn.Linear(q_lora_rank, num_heads * (qk_nope_head_dim + qk_rope_head_dim), bias=False)
+        self.W_q_proj = nn.Linear(
+            q_lora_rank, num_heads * (qk_nope_head_dim + qk_rope_head_dim), bias=False
+        )
 
         # ===== KV 投影 (下采样) =====
         # compress_kv: hidden_size -> kv_lora_rank (输出 qk_rope + qk_nope 的维度)
-        self.compress_kv = nn.Linear(hidden_size, num_heads * (qk_rope_head_dim + qk_nope_head_dim), bias=False)
+        self.compress_kv = nn.Linear(
+            hidden_size, num_heads * (qk_rope_head_dim + qk_nope_head_dim), bias=False
+        )
         # KV RMSNorm (针对 kv_nope 部分)
         self.kv_norm = RMSNorm(qk_nope_head_dim)
         # KV 上采样: qk_nope_head_dim -> (qk_nope_head_dim + v_head_dim)
-        self.W_kv_proj = nn.Linear(qk_nope_head_dim, qk_nope_head_dim + v_head_dim, bias=False)
+        self.W_kv_proj = nn.Linear(
+            qk_nope_head_dim, qk_nope_head_dim + v_head_dim, bias=False
+        )
 
         # Output projection
         self.o_proj = nn.Linear(num_heads * v_head_dim, hidden_size, bias=False)
@@ -114,13 +120,11 @@ class MultiheadLatentAttention(nn.Module):
 
         # RoPE: use precompute_freqs_cis from gpt_rope
         freqs_cos, freqs_sin = precompute_freqs_cis(
-            dim=qk_rope_head_dim,
-            end=max_seq_len,
-            rope_base=10000.0
+            dim=qk_rope_head_dim, end=max_seq_len, rope_base=10000.0
         )
 
-        self.register_buffer('freqs_cos', freqs_cos, persistent=False)
-        self.register_buffer('freqs_sin', freqs_sin, persistent=False)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
         # 注意力掩码
         causal_mask = torch.triu(torch.ones(max_seq_len, max_seq_len), diagonal=1)
@@ -139,11 +143,17 @@ class MultiheadLatentAttention(nn.Module):
 
         # View & Split: [batch, seq, num_heads * (qk_nope + qk_pe)] -> [batch, num_heads, seq, qk_nope + qk_pe]
         q_projected = q_projected.view(batch_size, seq_len, self.num_heads, -1)
-        q_projected = q_projected.transpose(1, 2)  # [batch, num_heads, seq, qk_nope + qk_pe]
+        q_projected = q_projected.transpose(
+            1, 2
+        )  # [batch, num_heads, seq, qk_nope + qk_pe]
 
         # 分离 q_nope 和 q_pe
-        q_nope = q_projected[:, :, :, :self.qk_nope_head_dim]  # [batch, num_heads, seq, qk_nope_head_dim]
-        q_pe = q_projected[:, :, :, self.qk_nope_head_dim:]  # [batch, num_heads, seq, qk_rope_head_dim]
+        q_nope = q_projected[
+            :, :, :, : self.qk_nope_head_dim
+        ]  # [batch, num_heads, seq, qk_nope_head_dim]
+        q_pe = q_projected[
+            :, :, :, self.qk_nope_head_dim :
+        ]  # [batch, num_heads, seq, qk_rope_head_dim]
 
         # ===== KV 投影路径 =====
         # compress_kv: [batch, seq, hidden] -> [batch, seq, kv_lora_rank]
@@ -151,12 +161,20 @@ class MultiheadLatentAttention(nn.Module):
 
         # View & Split (镜像切分): [batch, seq, kv_lora_rank] -> [batch, num_heads, seq, qk_rope + qk_nope]
         # 注意：这里的 qk_rope 对应 k_pe，qk_nope 对应 kv_nope
-        kv_compressed_split = kv_compressed.view(batch_size, seq_len, self.num_heads, -1)
-        kv_compressed_split = kv_compressed_split.transpose(1, 2)  # [batch, num_heads, seq, qk_rope + qk_nope]
+        kv_compressed_split = kv_compressed.view(
+            batch_size, seq_len, self.num_heads, -1
+        )
+        kv_compressed_split = kv_compressed_split.transpose(
+            1, 2
+        )  # [batch, num_heads, seq, qk_rope + qk_nope]
 
         # 镜像切分：获得 k_pe 和 kv_nope
-        k_pe = kv_compressed_split[:, :, :, :self.qk_rope_head_dim]  # [batch, num_heads, seq, qk_rope_head_dim]
-        kv_nope = kv_compressed_split[:, :, :, self.qk_rope_head_dim:]  # [batch, num_heads, seq, qk_nope_head_dim]
+        k_pe = kv_compressed_split[
+            :, :, :, : self.qk_rope_head_dim
+        ]  # [batch, num_heads, seq, qk_rope_head_dim]
+        kv_nope = kv_compressed_split[
+            :, :, :, self.qk_rope_head_dim :
+        ]  # [batch, num_heads, seq, qk_nope_head_dim]
 
         # kv_nope 展平处理 RMSNorm 和 Linear up project
         # [batch, num_heads, seq, qk_nope_head_dim] -> [batch*num_heads*seq, qk_nope_head_dim]
@@ -165,21 +183,33 @@ class MultiheadLatentAttention(nn.Module):
         kv_nope_flat = self.kv_norm(kv_nope_flat)
         # Linear up project: qk_nope_head_dim -> (qk_nope_head_dim + v_head_dim)
         # 这里需要一个投影层将 kv_nope 投影到 [k_nope, v] 的维度
-        kv_projected_flat = self.W_kv_proj(kv_nope_flat)  # [batch*num_heads*seq, qk_nope_head_dim + v_head_dim]
+        kv_projected_flat = self.W_kv_proj(
+            kv_nope_flat
+        )  # [batch*num_heads*seq, qk_nope_head_dim + v_head_dim]
         # 重塑回多头格式
         kv_projected = kv_projected_flat.view(batch_size, self.num_heads, seq_len, -1)
 
         # Split K_nope 和 V
-        k_nope = kv_projected[:, :, :, :self.qk_nope_head_dim]  # [batch, num_heads, seq, qk_nope_head_dim]
-        v = kv_projected[:, :, :, self.qk_nope_head_dim:]  # [batch, num_heads, seq, v_head_dim]
+        k_nope = kv_projected[
+            :, :, :, : self.qk_nope_head_dim
+        ]  # [batch, num_heads, seq, qk_nope_head_dim]
+        v = kv_projected[
+            :, :, :, self.qk_nope_head_dim :
+        ]  # [batch, num_heads, seq, v_head_dim]
 
         # ===== 应用 RoPE =====
         # RoPE 应用到 q_pe 和 k_pe
-        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, self.freqs_cos[:seq_len], self.freqs_sin[:seq_len])
+        q_pe, k_pe = apply_rotary_pos_emb(
+            q_pe, k_pe, self.freqs_cos[:seq_len], self.freqs_sin[:seq_len]
+        )
 
         # ===== 拼接 Q 和 K =====
-        q = torch.cat([q_nope, q_pe], dim=-1)  # [batch, num_heads, seq, qk_nope + qk_pe]
-        k = torch.cat([k_nope, k_pe], dim=-1)  # [batch, num_heads, seq, qk_nope + qk_pe]
+        q = torch.cat(
+            [q_nope, q_pe], dim=-1
+        )  # [batch, num_heads, seq, qk_nope + qk_pe]
+        k = torch.cat(
+            [k_nope, k_pe], dim=-1
+        )  # [batch, num_heads, seq, qk_nope + qk_pe]
 
         # ===== 注意力计算 =====
         scale = 1.0 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
@@ -187,7 +217,9 @@ class MultiheadLatentAttention(nn.Module):
 
         # 应用因果掩码（上三角矩阵）
         # 扩展mask维度以匹配多头注意力: [1, 1, seq_len, seq_len]
-        mask_expanded = self.causal_mask[:seq_len, :seq_len].view(1, 1, seq_len, seq_len)
+        mask_expanded = self.causal_mask[:seq_len, :seq_len].view(
+            1, 1, seq_len, seq_len
+        )
         attn_scores.masked_fill_(mask_expanded.bool(), -torch.inf)
 
         # 计算注意力概率
@@ -199,7 +231,9 @@ class MultiheadLatentAttention(nn.Module):
 
         # ===== 输出投影 =====
         # 拼接所有头并投影
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        attn_output = (
+            attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        )
         output = self.o_proj(attn_output)
         return self.resid_dropout(output)
 
@@ -214,15 +248,15 @@ class DeepseekMoEGate(nn.Module):
     """
 
     def __init__(
-            self,
-            hidden_size: int,
-            n_routed_experts: int = 256,
-            num_experts_per_tok: int = 8,
-            n_group: int = 8,
-            topk_group: int = 4,
-            norm_topk_prob: bool = True,
-            aux_loss_alpha: float = 0.001,
-            z_loss_alpha: float = 0.0001,  # 新增：z-loss 防止路由 logits 过大
+        self,
+        hidden_size: int,
+        n_routed_experts: int = 256,
+        num_experts_per_tok: int = 8,
+        n_group: int = 8,
+        topk_group: int = 4,
+        norm_topk_prob: bool = True,
+        aux_loss_alpha: float = 0.001,
+        z_loss_alpha: float = 0.0001,  # 新增：z-loss 防止路由 logits 过大
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -239,8 +273,8 @@ class DeepseekMoEGate(nn.Module):
         self.gate = nn.Linear(hidden_size, n_routed_experts, bias=False)
 
     def forward(
-            self,
-            hidden_states: torch.Tensor,
+        self,
+        hidden_states: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass of MoE gating (参考 DeepSeekMoE).
 
@@ -276,7 +310,9 @@ class DeepseekMoEGate(nn.Module):
         )
 
         # 映射回原始专家索引
-        selected_group_idx = torch.div(topk_idx_in_candidates, self.topk_group, rounding_mode='floor')
+        selected_group_idx = torch.div(
+            topk_idx_in_candidates, self.topk_group, rounding_mode="floor"
+        )
         expert_idx_in_group = group_topk_idx.gather(1, topk_idx_in_candidates)
         topk_idx = selected_group_idx * group_size + expert_idx_in_group
 
@@ -291,7 +327,9 @@ class DeepseekMoEGate(nn.Module):
             # 专家负载平衡损失 (Load Balancing Loss)
             if self.aux_loss_alpha > 0:
                 # 计算每个专家被选中的频率
-                expert_mask = F.one_hot(topk_idx.view(-1), num_classes=self.n_routed_experts).float()
+                expert_mask = F.one_hot(
+                    topk_idx.view(-1), num_classes=self.n_routed_experts
+                ).float()
                 expert_counts = expert_mask.sum(0)  # [n_experts]
 
                 # 计算每个专家的平均路由概率
@@ -304,7 +342,9 @@ class DeepseekMoEGate(nn.Module):
 
             # Z-loss：防止路由 logits 过大
             if self.z_loss_alpha > 0:
-                z_loss = (torch.log(F.softmax(logits, dim=-1).sum(0)) ** 2).mean() * self.z_loss_alpha
+                z_loss = (
+                    torch.log(F.softmax(logits, dim=-1).sum(0)) ** 2
+                ).mean() * self.z_loss_alpha
 
         total_aux_loss = aux_loss + z_loss
 
@@ -325,14 +365,14 @@ class DeepseekV3MoE(nn.Module):
     """
 
     def __init__(
-            self,
-            hidden_size: int,
-            intermediate_size: int = 2048,
-            n_routed_experts: int = 256,
-            n_shared_experts: int = 2,
-            num_experts_per_tok: int = 8,
-            n_group: int = 8,
-            topk_group: int = 4,
+        self,
+        hidden_size: int,
+        intermediate_size: int = 2048,
+        n_routed_experts: int = 256,
+        n_shared_experts: int = 2,
+        num_experts_per_tok: int = 8,
+        n_group: int = 8,
+        topk_group: int = 4,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -354,16 +394,20 @@ class DeepseekV3MoE(nn.Module):
         )
 
         # 路由专家 (共享权重的方式以节省内存)
-        self.experts = nn.ModuleList([
-            DeepSeekV3MLP(hidden_size, intermediate_size)
-            for _ in range(n_routed_experts)
-        ])
+        self.experts = nn.ModuleList(
+            [
+                DeepSeekV3MLP(hidden_size, intermediate_size)
+                for _ in range(n_routed_experts)
+            ]
+        )
 
         # 共享专家 (始终激活，参考 DeepSeekMoE)
-        self.shared_experts = nn.ModuleList([
-            DeepSeekV3MLP(hidden_size, intermediate_size)
-            for _ in range(n_shared_experts)
-        ])
+        self.shared_experts = nn.ModuleList(
+            [
+                DeepSeekV3MLP(hidden_size, intermediate_size)
+                for _ in range(n_shared_experts)
+            ]
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass 优化版本.
@@ -399,10 +443,10 @@ class DeepseekV3MoE(nn.Module):
         return output
 
     def _process_routed_experts(
-            self,
-            hidden_states: torch.Tensor,
-            top_k_indices: torch.Tensor,
-            top_k_gates: torch.Tensor,
+        self,
+        hidden_states: torch.Tensor,
+        top_k_indices: torch.Tensor,
+        top_k_gates: torch.Tensor,
     ) -> torch.Tensor:
         """高效处理路由专家的辅助函数.
 
@@ -432,7 +476,9 @@ class DeepseekV3MoE(nn.Module):
         expert_counts = flat_idx.bincount(minlength=self.n_routed_experts)
 
         # 计算每个专家的起始位置（前缀和）
-        expert_offsets = torch.zeros(self.num_experts, dtype=torch.long, device=flat_idx.device)
+        expert_offsets = torch.zeros(
+            self.num_experts, dtype=torch.long, device=flat_idx.device
+        )
         expert_offsets[1:] = expert_counts[:-1].cumsum(0)
 
         # 按专家分组批量处理
@@ -444,7 +490,7 @@ class DeepseekV3MoE(nn.Module):
                 continue
 
             # 获取该专家负责的token在排序后的位置
-            sorted_positions = sorted_idx[start:start + count]
+            sorted_positions = sorted_idx[start : start + count]
             # 获取对应的原始token索引
             token_indices = sorted_positions // self.top_k
 
@@ -473,23 +519,23 @@ class DeepseekV3DecoderLayer(nn.Module):
     """
 
     def __init__(
-            self,
-            hidden_size: int,
-            num_heads: int,
-            intermediate_size: int,
-            n_routed_experts: int = 256,
-            n_shared_experts: int = 2,
-            num_experts_per_tok: int = 8,
-            n_group: int = 8,
-            topk_group: int = 4,
-            q_lora_rank: int = 1536,
-            kv_lora_rank: int = 512,
-            qk_nope_head_dim: int = 128,
-            qk_rope_head_dim: int = 64,
-            v_head_dim: int = 128,
-            max_seq_len: int = 2048,
-            first_k_dense_replace: int = 1,
-            layer_id: int = 0,
+        self,
+        hidden_size: int,
+        num_heads: int,
+        intermediate_size: int,
+        n_routed_experts: int = 256,
+        n_shared_experts: int = 2,
+        num_experts_per_tok: int = 8,
+        n_group: int = 8,
+        topk_group: int = 4,
+        q_lora_rank: int = 1536,
+        kv_lora_rank: int = 512,
+        qk_nope_head_dim: int = 128,
+        qk_rope_head_dim: int = 64,
+        v_head_dim: int = 128,
+        max_seq_len: int = 2048,
+        first_k_dense_replace: int = 1,
+        layer_id: int = 0,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -527,8 +573,8 @@ class DeepseekV3DecoderLayer(nn.Module):
             self.mlp = DeepSeekV3MLP(hidden_size, intermediate_size)
 
     def forward(
-            self,
-            x: torch.Tensor,
+        self,
+        x: torch.Tensor,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -556,24 +602,24 @@ class DeepseekV3(nn.Module):
     """
 
     def __init__(
-            self,
-            vocab_size: int = 129280,
-            hidden_size: int = 7168,
-            num_attention_heads: int = 64,
-            num_hidden_layers: int = 60,
-            intermediate_size: int = 2048,
-            n_routed_experts: int = 256,
-            n_shared_experts: int = 2,
-            num_experts_per_tok: int = 8,
-            n_group: int = 8,
-            topk_group: int = 4,
-            q_lora_rank: int = 1536,
-            kv_lora_rank: int = 512,
-            qk_nope_head_dim: int = 128,
-            qk_rope_head_dim: int = 64,
-            v_head_dim: int = 128,
-            max_position_embeddings: int = 4096,
-            first_k_dense_replace: int = 1,
+        self,
+        vocab_size: int = 129280,
+        hidden_size: int = 7168,
+        num_attention_heads: int = 64,
+        num_hidden_layers: int = 60,
+        intermediate_size: int = 2048,
+        n_routed_experts: int = 256,
+        n_shared_experts: int = 2,
+        num_experts_per_tok: int = 8,
+        n_group: int = 8,
+        topk_group: int = 4,
+        q_lora_rank: int = 1536,
+        kv_lora_rank: int = 512,
+        qk_nope_head_dim: int = 128,
+        qk_rope_head_dim: int = 64,
+        v_head_dim: int = 128,
+        max_position_embeddings: int = 4096,
+        first_k_dense_replace: int = 1,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -584,27 +630,29 @@ class DeepseekV3(nn.Module):
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
 
         # Layers
-        self.layers = nn.ModuleList([
-            DeepseekV3DecoderLayer(
-                hidden_size=hidden_size,
-                num_heads=num_attention_heads,
-                intermediate_size=intermediate_size,
-                n_routed_experts=n_routed_experts,
-                n_shared_experts=n_shared_experts,
-                num_experts_per_tok=num_experts_per_tok,
-                n_group=n_group,
-                topk_group=topk_group,
-                q_lora_rank=q_lora_rank,
-                kv_lora_rank=kv_lora_rank,
-                qk_nope_head_dim=qk_nope_head_dim,
-                qk_rope_head_dim=qk_rope_head_dim,
-                v_head_dim=v_head_dim,
-                max_seq_len=max_position_embeddings,
-                first_k_dense_replace=first_k_dense_replace,
-                layer_id=i,
-            )
-            for i in range(num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                DeepseekV3DecoderLayer(
+                    hidden_size=hidden_size,
+                    num_heads=num_attention_heads,
+                    intermediate_size=intermediate_size,
+                    n_routed_experts=n_routed_experts,
+                    n_shared_experts=n_shared_experts,
+                    num_experts_per_tok=num_experts_per_tok,
+                    n_group=n_group,
+                    topk_group=topk_group,
+                    q_lora_rank=q_lora_rank,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_nope_head_dim=qk_nope_head_dim,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    v_head_dim=v_head_dim,
+                    max_seq_len=max_position_embeddings,
+                    first_k_dense_replace=first_k_dense_replace,
+                    layer_id=i,
+                )
+                for i in range(num_hidden_layers)
+            ]
+        )
 
         # Final layer norm
         self.norm = RMSNorm(hidden_size)
@@ -613,8 +661,8 @@ class DeepseekV3(nn.Module):
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
     def forward(
-            self,
-            input_ids: torch.Tensor,
+        self,
+        input_ids: torch.Tensor,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -651,14 +699,13 @@ if __name__ == "__main__":
         def export_and_simplify(*args, **kwargs):
             raise ImportError("请确保 utils.onnx_utils 模块存在")
 
-
         def validate_onnx(*args, **kwargs):
             return False
 
     # Test code
     batch_size = 2
-    seq_len = 8
-    max_new_tokens = 10
+    seq_len = 20
+    max_new_tokens = 20
 
     model = DeepseekV3(
         vocab_size=1000,
@@ -671,7 +718,7 @@ if __name__ == "__main__":
         num_experts_per_tok=4,
         n_group=4,  # 4 groups
         topk_group=2,  # Select top-2 from each group
-        first_k_dense_replace=1  # 实际上 deepseek 61 层，[0，1，2] 是 mlp, [3，...，60] 是 moe
+        first_k_dense_replace=1,  # 实际上 deepseek 61 层，[0，1，2] 是 mlp, [3，...，60] 是 moe
     )
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -697,9 +744,9 @@ if __name__ == "__main__":
         dummy_input=(input_ids,),  # 只传入 input_ids
         onnx_path=onnx_path,
         simplify=True,
-        input_names=['input_ids'],
-        output_names=['logits'],
-        skipped_optimizers=['FuseMatMul'],
+        input_names=["input_ids"],
+        output_names=["logits"],
+        skipped_optimizers=["FuseMatMul"],
     )
 
     # 验证ONNX模型

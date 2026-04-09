@@ -11,6 +11,7 @@ Qwen3 MoE (Mixture of Experts) 模型实现
 - SwiGLU: 激活函数 (SiLU/Swish + GLU)
 - TopK专家路由: 每个token选择top-k个专家
 """
+
 import os
 
 import torch
@@ -104,10 +105,9 @@ class Qwen3SimpleMoE(nn.Module):
 
         # 专家网络 (每个专家是一个 SwiGLU MLP)
         # SwiGLU: gate_proj + up_proj -> SiLU(gate) * up -> down_proj
-        self.experts = nn.ModuleList([
-            SwiGLU(hidden_size, intermediate_size)
-            for _ in range(num_experts)
-        ])
+        self.experts = nn.ModuleList(
+            [SwiGLU(hidden_size, intermediate_size) for _ in range(num_experts)]
+        )
 
         # 共享专家 (所有 token 都会经过)
         self.shared_expert = TrueSwiGLU(hidden_size, intermediate_size)
@@ -147,7 +147,9 @@ class Qwen3SimpleMoE(nn.Module):
         expert_counts = flat_idx.bincount(minlength=self.num_experts)
 
         # 计算每个专家的起始位置（前缀和）
-        expert_offsets = torch.zeros(self.num_experts, dtype=torch.long, device=flat_idx.device)
+        expert_offsets = torch.zeros(
+            self.num_experts, dtype=torch.long, device=flat_idx.device
+        )
         expert_offsets[1:] = expert_counts[:-1].cumsum(0)
 
         # 按专家分组批量处理
@@ -159,7 +161,7 @@ class Qwen3SimpleMoE(nn.Module):
                 continue
 
             # 获取该专家负责的token在排序后的位置
-            sorted_positions = sorted_idx[start:start + count]
+            sorted_positions = sorted_idx[start : start + count]
             # 获取对应的原始token索引
             token_indices = sorted_positions // self.top_k
 
@@ -179,7 +181,6 @@ class Qwen3SimpleMoE(nn.Module):
 
         # 恢复原始形状
         return final_hidden_states.view(batch_size, seq_len, hidden_dim)
-
 
     def forward_backup(self, hidden_states):
         """
@@ -204,16 +205,17 @@ class Qwen3SimpleMoE(nn.Module):
         # ===== 3. ONNX兼容的专家批量计算（核心修改） =====
         # 预分配输出张量
         expert_outputs_total = torch.zeros(
-            num_tokens, hidden_dim,
+            num_tokens,
+            hidden_dim,
             device=hidden_states.device,
-            dtype=hidden_states.dtype
+            dtype=hidden_states.dtype,
         )
 
         # 【关键】用固定循环替代动态索引循环，循环次数固定为num_experts（编译时确定）
         # ONNX对固定次数的循环完美支持，完全不会触发动态形状推断问题
         for expert_id in range(self.num_experts):
             # 生成掩码：哪些token选中了当前专家，形状[num_tokens, top_k]
-            token_mask = (top_k_indices == expert_id)  # bool张量，ONNX完全支持
+            token_mask = top_k_indices == expert_id  # bool张量，ONNX完全支持
             if not token_mask.any():
                 continue  # 无token选中，跳过
 
@@ -232,7 +234,9 @@ class Qwen3SimpleMoE(nn.Module):
             expert_out_weighted = expert_out * selected_weights
 
             # 回填到输出张量，用掩码替代index_add_，ONNX完全兼容
-            expert_outputs_total[token_weights_sum.squeeze(-1) > 0] += expert_out_weighted
+            expert_outputs_total[token_weights_sum.squeeze(-1) > 0] += (
+                expert_out_weighted
+            )
 
         # ===== 4. 合并共享专家 完全不变 =====
         final_hidden_states = expert_outputs_total + shared_output
@@ -260,6 +264,7 @@ class Qwen3SimpleMoE(nn.Module):
 #    - 共享内存利用
 #    - 异步执行
 
+
 class Qwen3MoEDecoderLayer(nn.Module):
     """
     Qwen3 MoE Decoder层
@@ -277,16 +282,16 @@ class Qwen3MoEDecoderLayer(nn.Module):
     """
 
     def __init__(
-            self,
-            hidden_size: int,
-            num_heads: int,
-            num_kv_heads: int,
-            num_experts: int = 8,
-            top_k: int = 2,
-            intermediate_size: int = 2048,
-            dropout: float = 0.0,
-            rope_base: float = 1000000.0,
-            max_seq_len: int = 1024,
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        num_experts: int = 8,
+        top_k: int = 2,
+        intermediate_size: int = 2048,
+        dropout: float = 0.0,
+        rope_base: float = 1000000.0,
+        max_seq_len: int = 1024,
     ):
         super().__init__()
 
@@ -354,18 +359,18 @@ class Qwen3MoEModel(nn.Module):
     """
 
     def __init__(
-            self,
-            vocab_size: int,
-            hidden_size: int = 768,
-            num_attention_heads: int = 12,
-            num_key_value_heads: int = 2,  # GQA: KV头数少于Q头数
-            num_hidden_layers: int = 1,
-            num_experts: int = 8,  # MoE专家总数
-            top_k: int = 2,  # 每个token激活的专家数
-            intermediate_size: int = 2048,
-            dropout: float = 0.0,
-            rope_base: float = 1000000.0,
-            max_position_embeddings: int = 1024,
+        self,
+        vocab_size: int,
+        hidden_size: int = 768,
+        num_attention_heads: int = 12,
+        num_key_value_heads: int = 2,  # GQA: KV头数少于Q头数
+        num_hidden_layers: int = 1,
+        num_experts: int = 8,  # MoE专家总数
+        top_k: int = 2,  # 每个token激活的专家数
+        intermediate_size: int = 2048,
+        dropout: float = 0.0,
+        rope_base: float = 1000000.0,
+        max_position_embeddings: int = 1024,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -376,20 +381,22 @@ class Qwen3MoEModel(nn.Module):
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
 
         # Transformer层堆叠
-        self.layers = nn.ModuleList([
-            Qwen3MoEDecoderLayer(
-                hidden_size=hidden_size,
-                num_heads=num_attention_heads,
-                num_kv_heads=num_key_value_heads,
-                num_experts=num_experts,
-                top_k=top_k,
-                intermediate_size=intermediate_size,
-                dropout=dropout,
-                rope_base=rope_base,
-                max_seq_len=max_position_embeddings,
-            )
-            for _ in range(num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                Qwen3MoEDecoderLayer(
+                    hidden_size=hidden_size,
+                    num_heads=num_attention_heads,
+                    num_kv_heads=num_key_value_heads,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    intermediate_size=intermediate_size,
+                    dropout=dropout,
+                    rope_base=rope_base,
+                    max_seq_len=max_position_embeddings,
+                )
+                for _ in range(num_hidden_layers)
+            ]
+        )
 
         # 最终归一化层
         self.norm = nn.LayerNorm(hidden_size)
@@ -456,9 +463,9 @@ if __name__ == "__main__":
         dummy_input=dummy_input,
         onnx_path=onnx_path,
         simplify=True,
-        input_names=['input_ids'],
-        output_names=['logits'],
-        skipped_optimizers=['FuseMatMul'],
+        input_names=["input_ids"],
+        output_names=["logits"],
+        skipped_optimizers=["FuseMatMul"],
     )
 
     # 验证ONNX模型

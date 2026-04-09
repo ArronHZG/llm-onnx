@@ -12,6 +12,7 @@ Qwen3.5 Dense 模型实现
 - Pre-LN结构
 - 自定义ONNX算子：GatedDeltaRule
 """
+
 import math
 import os
 
@@ -52,8 +53,14 @@ class GatedDeltaRuleOp(torch.autograd.Function):
         ONNX 符号定义
         """
         output = g.op(
-            'custom::GatedDeltaRule',
-            q, k, v, a, b, A_log, dt_bias,
+            "custom::GatedDeltaRule",
+            q,
+            k,
+            v,
+            a,
+            b,
+            A_log,
+            dt_bias,
             head_dim_i=head_dim,
             conv_kernel_size_i=conv_kernel_size,
         )
@@ -104,29 +111,31 @@ class GatedDeltaRuleOp(torch.autograd.Function):
         beta = torch.sigmoid(b)  # [B, S, H]
 
         # ===== GatedDeltaRule 计算 =====
-        scale = 1.0 / (head_dim ** 0.5)
+        scale = 1.0 / (head_dim**0.5)
         output = torch.zeros_like(v)
 
         # 初始化状态 S: [batch, num_heads, head_dim, head_dim]
-        S = torch.zeros(batch, num_heads, head_dim, head_dim, dtype=q.dtype, device=q.device)
+        S = torch.zeros(
+            batch, num_heads, head_dim, head_dim, dtype=q.dtype, device=q.device
+        )
 
         for i in range(seq_len):
-            q_i = q[:, i, :, :]      # [B, H, D]
-            k_i = k[:, i, :, :]      # [B, H, D]
-            v_i = v[:, i, :, :]      # [B, H, D]
-            g_i = g[:, i, :]          # [B, H]
-            beta_i = beta[:, i, :]    # [B, H]
+            q_i = q[:, i, :, :]  # [B, H, D]
+            k_i = k[:, i, :, :]  # [B, H, D]
+            v_i = v[:, i, :, :]  # [B, H, D]
+            g_i = g[:, i, :]  # [B, H]
+            beta_i = beta[:, i, :]  # [B, H]
 
             # 扩展维度用于状态计算
             g_i = g_i.unsqueeze(-1).unsqueeze(-1)  # [B, H, 1, 1]
-            beta_i = beta_i.unsqueeze(-1)           # [B, H, 1]
+            beta_i = beta_i.unsqueeze(-1)  # [B, H, 1]
 
             # 状态更新: S = g * S + k * v
             kv_term = k_i.unsqueeze(-1) * v_i.unsqueeze(-2)  # [B, H, D, D]
             S = g_i * S + kv_term
 
             # 输出: o = beta * (q @ S) * scale
-            o_i = torch.einsum('bhd,bhdm->bhm', q_i, S)  # [B, H, D]
+            o_i = torch.einsum("bhd,bhdm->bhm", q_i, S)  # [B, H, D]
             o_i = o_i * beta_i * scale
 
             output[:, i, :, :] = o_i
@@ -144,7 +153,7 @@ class GatedDeltaRuleOp(torch.autograd.Function):
         head_dim = ctx.head_dim
 
         batch, seq_len, num_heads, _ = q.shape
-        scale = 1.0 / (head_dim ** 0.5)
+        scale = 1.0 / (head_dim**0.5)
 
         # 初始化梯度
         grad_q = torch.zeros_like(q)
@@ -156,7 +165,9 @@ class GatedDeltaRuleOp(torch.autograd.Function):
         grad_dt_bias = torch.zeros_like(dt_bias)
 
         # 反向计算
-        S = torch.zeros(batch, num_heads, head_dim, head_dim, dtype=q.dtype, device=q.device)
+        S = torch.zeros(
+            batch, num_heads, head_dim, head_dim, dtype=q.dtype, device=q.device
+        )
 
         for i in range(seq_len - 1, -1, -1):
             q_i = q[:, i, :, :]
@@ -171,7 +182,9 @@ class GatedDeltaRuleOp(torch.autograd.Function):
             S = g_i * S + kv_term
 
             # 梯度计算
-            grad_q[:, i, :, :] = torch.einsum('bhd,bhdm->bhm', do_i * beta_i * scale, S.transpose(-2, -1))
+            grad_q[:, i, :, :] = torch.einsum(
+                "bhd,bhdm->bhm", do_i * beta_i * scale, S.transpose(-2, -1)
+            )
             # 简化 grad_v: grad_v = do * beta * scale * q (忽略 S)
             grad_v[:, i, :, :] = do_i * beta_i * scale * q_i
 
@@ -182,7 +195,17 @@ class GatedDeltaRuleOp(torch.autograd.Function):
 
         # 注意: grad_q, grad_k, grad_v 已经是 [B, S, H, D] 形状，不需要 reshape
 
-        return grad_q, grad_k, grad_v, grad_a, grad_b, grad_A_log, grad_dt_bias, None, None
+        return (
+            grad_q,
+            grad_k,
+            grad_v,
+            grad_a,
+            grad_b,
+            grad_A_log,
+            grad_dt_bias,
+            None,
+            None,
+        )
 
 
 # 注册 ONNX 符号处理（在 symbolic 方法中已完成，这里作为备选）
@@ -194,19 +217,21 @@ def _register_onnx_ops():
         def symbolic_gated_delta_rule(g, q, k, v, a, b, head_dim, conv_kernel_size):
             """GatedDeltaRuleOp 的 ONNX 符号处理"""
             output = g.op(
-                'custom::GatedDeltaRule',
-                q, k, v, a, b,
+                "custom::GatedDeltaRule",
+                q,
+                k,
+                v,
+                a,
+                b,
                 head_dim_i=head_dim,
-                conv_kernel_size_i=conv_kernel_size
+                conv_kernel_size_i=conv_kernel_size,
             )
             # 使用 Identity 帮助形状推断
             output.setType(q.type().with_sizes(q.sizes()))
-            return g.op('Identity', output)
+            return g.op("Identity", output)
 
         register_custom_op_symbolic(
-            'custom::gated_delta_rule_op',
-            symbolic_gated_delta_rule,
-            opset_version=14
+            "custom::gated_delta_rule_op", symbolic_gated_delta_rule, opset_version=14
         )
     except Exception:
         pass
@@ -228,7 +253,7 @@ class GatedDeltaRuleModule(nn.Module):
         self.head_dim = head_dim
         self.conv_kernel_size = conv_kernel_size
         self.num_heads = num_heads
-        self._export_op_name = 'sglang::GatedDeltaRule'
+        self._export_op_name = "sglang::GatedDeltaRule"
 
         # ===== Mamba-style gate 参数 =====
         # A_log: 状态转移矩阵对数 [num_heads]
@@ -254,8 +279,14 @@ class GatedDeltaRuleModule(nn.Module):
         # self.A_log = nn.Parameter(torch.zeros(num_heads))
         # self.dt_bias = nn.Parameter(torch.zeros(num_heads))
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ) -> torch.Tensor:
         """
         执行 GatedDeltaRule 计算
 
@@ -272,8 +303,15 @@ class GatedDeltaRuleModule(nn.Module):
             output: [batch, seq_len, num_heads, head_dim]
         """
         return GatedDeltaRuleOp.apply(
-            q, k, v, a, b, self.A_log, self.dt_bias,
-            self.head_dim, self.conv_kernel_size
+            q,
+            k,
+            v,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            self.head_dim,
+            self.conv_kernel_size,
         )
 
 
@@ -300,16 +338,16 @@ class GatedDeltaNet(nn.Module):
     """
 
     def __init__(
-            self,
-            hidden_size: int,
-            num_heads: int,
-            num_kv_heads: int,
-            head_dim: int = 128,
-            conv_kernel_size: int = 4,
-            rope_base: float = 1000000.0,
-            max_seq_len: int = 1024,
-            use_gate: bool = True,  # 输出门控
-            use_mamba_gate: bool = True,  # Mamba-style gate
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int = 128,
+        conv_kernel_size: int = 4,
+        rope_base: float = 1000000.0,
+        max_seq_len: int = 1024,
+        use_gate: bool = True,  # 输出门控
+        use_mamba_gate: bool = True,  # Mamba-style gate
     ):
         super().__init__()
         assert hidden_size % num_heads == 0
@@ -351,7 +389,7 @@ class GatedDeltaNet(nn.Module):
             kernel_size=conv_kernel_size,
             padding=conv_kernel_size - 1,
             groups=self.key_dim,
-            bias=False
+            bias=False,
         )
         # K, V: num_kv_heads * head_dim
         self.k_conv = nn.Conv1d(
@@ -360,7 +398,7 @@ class GatedDeltaNet(nn.Module):
             kernel_size=conv_kernel_size,
             padding=conv_kernel_size - 1,
             groups=self.key_dim,
-            bias=False
+            bias=False,
         )
         self.v_conv = nn.Conv1d(
             in_channels=self.value_dim,
@@ -368,12 +406,14 @@ class GatedDeltaNet(nn.Module):
             kernel_size=conv_kernel_size,
             padding=conv_kernel_size - 1,
             groups=self.value_dim,
-            bias=False
+            bias=False,
         )
 
         # ===== GatedDeltaRule ONNX算子 =====
         self.gated_delta_rule_module = GatedDeltaRuleModule(
-            head_dim, conv_kernel_size, num_heads,
+            head_dim,
+            conv_kernel_size,
+            num_heads,
         )
 
         # ===== 注意力输出归一化 =====
@@ -389,12 +429,10 @@ class GatedDeltaNet(nn.Module):
 
         # ===== RoPE =====
         freqs_cos, freqs_sin = precompute_freqs_cis(
-            dim=head_dim,
-            end=max_seq_len,
-            rope_base=rope_base
+            dim=head_dim, end=max_seq_len, rope_base=rope_base
         )
-        self.register_buffer('freqs_cos', freqs_cos, persistent=False)
-        self.register_buffer('freqs_sin', freqs_sin, persistent=False)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -448,9 +486,7 @@ class GatedDeltaNet(nn.Module):
         k = k.transpose(1, 2)
 
         q, k = apply_rotary_pos_emb(
-            q, k,
-            self.freqs_cos[:seq_len],
-            self.freqs_sin[:seq_len]
+            q, k, self.freqs_cos[:seq_len], self.freqs_sin[:seq_len]
         )
 
         # 转回 [B, S, H, D]
@@ -473,7 +509,9 @@ class GatedDeltaNet(nn.Module):
         attn_output = self.gated_delta_rule_module(q, k, v, a, b)
 
         # ===== Reshape 输出 (flatten 到 num_heads * head_dim) =====
-        attn_output = attn_output.view(batch_size, seq_len, -1)  # [B, S, num_heads * head_dim]
+        attn_output = attn_output.view(
+            batch_size, seq_len, -1
+        )  # [B, S, num_heads * head_dim]
         print(f"attn_output: {attn_output.shape}")
 
         # ===== 归一化, 应用z门控 =====
@@ -498,15 +536,15 @@ class GatedAttention(nn.Module):
     """
 
     def __init__(
-            self,
-            hidden_size: int,
-            num_heads: int,
-            num_kv_heads: int,
-            head_dim: int = 128,
-            dropout: float = 0.0,
-            rope_base: float = 1000000.0,
-            max_seq_len: int = 1024,
-            attn_output_gate: bool = True,
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int = 128,
+        dropout: float = 0.0,
+        rope_base: float = 1000000.0,
+        max_seq_len: int = 1024,
+        attn_output_gate: bool = True,
     ):
         super().__init__()
         assert hidden_size % num_heads == 0
@@ -530,9 +568,7 @@ class GatedAttention(nn.Module):
             self.q_output_size = self.q_size
 
         self.qkv_proj = nn.Linear(
-            hidden_size,
-            self.q_output_size + 2 * self.kv_size,
-            bias=False
+            hidden_size, self.q_output_size + 2 * self.kv_size, bias=False
         )
 
         # O投影
@@ -546,16 +582,14 @@ class GatedAttention(nn.Module):
 
         # RoPE
         freqs_cos, freqs_sin = precompute_freqs_cis(
-            dim=head_dim,
-            end=max_seq_len,
-            rope_base=rope_base
+            dim=head_dim, end=max_seq_len, rope_base=rope_base
         )
-        self.register_buffer('freqs_cos', freqs_cos, persistent=False)
-        self.register_buffer('freqs_sin', freqs_sin, persistent=False)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
         # 因果掩码
         mask = torch.triu(torch.ones(max_seq_len, max_seq_len), diagonal=1)
-        self.register_buffer('causal_mask', mask, persistent=False)
+        self.register_buffer("causal_mask", mask, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -571,17 +605,25 @@ class GatedAttention(nn.Module):
 
         # 2. 分割Q, K, V
         if self.attn_output_gate:
-            q_gate, k, v = qkv.split([self.q_output_size, self.kv_size, self.kv_size], dim=-1)
+            q_gate, k, v = qkv.split(
+                [self.q_output_size, self.kv_size, self.kv_size], dim=-1
+            )
             # 分割gate
             q, gate = q_gate.chunk(2, dim=-1)
         else:
-            q, k, v = qkv.split([self.q_output_size, self.kv_size, self.kv_size], dim=-1)
+            q, k, v = qkv.split(
+                [self.q_output_size, self.kv_size, self.kv_size], dim=-1
+            )
             gate = None
 
         # 3. Reshape
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(
+            1, 2
+        )
+        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(
+            1, 2
+        )
 
         # 4. QK归一化
         q = self.q_norm(q)
@@ -589,9 +631,7 @@ class GatedAttention(nn.Module):
 
         # 5. RoPE - apply_rotary_pos_emb 期望 [batch, heads, seq, head_dim]
         q, k = apply_rotary_pos_emb(
-            q, k,
-            self.freqs_cos[:seq_len],
-            self.freqs_sin[:seq_len]
+            q, k, self.freqs_cos[:seq_len], self.freqs_sin[:seq_len]
         )
 
         # 6. GQA: 扩展K,V到Q的头数
@@ -604,7 +644,9 @@ class GatedAttention(nn.Module):
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
         # 因果掩码
-        mask_expanded = self.causal_mask[:seq_len, :seq_len].view(1, 1, seq_len, seq_len)
+        mask_expanded = self.causal_mask[:seq_len, :seq_len].view(
+            1, 1, seq_len, seq_len
+        )
         attn_scores.masked_fill_(mask_expanded.bool(), -torch.inf)
 
         # Softmax
@@ -616,7 +658,9 @@ class GatedAttention(nn.Module):
 
         # 恢复形状
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(batch_size, seq_len, self.num_heads * self.head_dim)
+        attn_output = attn_output.view(
+            batch_size, seq_len, self.num_heads * self.head_dim
+        )
 
         # 应用输出门控
         if self.attn_output_gate and gate is not None:
@@ -633,17 +677,17 @@ class Qwen3_5DecoderLayer(nn.Module):
     """Qwen3.5 Decoder层 (支持GatedDeltaNet线性注意力)"""
 
     def __init__(
-            self,
-            hidden_size: int,
-            num_heads: int,
-            num_kv_heads: int,
-            head_dim: int = 128,
-            intermediate_size: int = 2048,
-            use_linear_attention: bool = True,  # Qwen3.5特色
-            dropout: float = 0.0,
-            rope_base: float = 1000000.0,
-            max_seq_len: int = 1024,
-            conv_kernel_size: int = 4,
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int = 128,
+        intermediate_size: int = 2048,
+        use_linear_attention: bool = True,  # Qwen3.5特色
+        dropout: float = 0.0,
+        rope_base: float = 1000000.0,
+        max_seq_len: int = 1024,
+        conv_kernel_size: int = 4,
     ):
         super().__init__()
 
@@ -706,18 +750,18 @@ class Qwen3_5DenseModel(nn.Module):
     """
 
     def __init__(
-            self,
-            vocab_size: int,
-            hidden_size: int = 768,
-            num_attention_heads: int = 12,
-            num_key_value_heads: int = 2,  # GQA
-            head_dim: int = 128,
-            num_hidden_layers: int = 4,  # 默认4层: 3层GatedDeltaNet + 1层GatedAttention
-            intermediate_size: int = 2048,
-            dropout: float = 0.0,
-            rope_base: float = 1000000.0,
-            max_position_embeddings: int = 1024,
-            conv_kernel_size: int = 4,
+        self,
+        vocab_size: int,
+        hidden_size: int = 768,
+        num_attention_heads: int = 12,
+        num_key_value_heads: int = 2,  # GQA
+        head_dim: int = 128,
+        num_hidden_layers: int = 4,  # 默认4层: 3层GatedDeltaNet + 1层GatedAttention
+        intermediate_size: int = 2048,
+        dropout: float = 0.0,
+        rope_base: float = 1000000.0,
+        max_position_embeddings: int = 1024,
+        conv_kernel_size: int = 4,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -835,9 +879,9 @@ if __name__ == "__main__":
         dummy_input=dummy_input,
         onnx_path=onnx_path,
         simplify=True,
-        input_names=['input_ids'],
-        output_names=['logits'],
-        skipped_optimizers=['FuseMatMul'],
+        input_names=["input_ids"],
+        output_names=["logits"],
+        skipped_optimizers=["FuseMatMul"],
     )
 
     # 验证ONNX模型

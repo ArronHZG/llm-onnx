@@ -13,6 +13,7 @@ Qwen3.5 MoE (Mixture of Experts) 模型实现
 - TopK专家路由: 每个token选择top-k个专家
 - Pre-LN结构
 """
+
 import os
 import random
 
@@ -70,10 +71,9 @@ class SimpleMoE(nn.Module):
 
         # 专家网络 (每个专家是一个 SwiGLU MLP)
         # SwiGLU: gate_proj + up_proj -> SiLU(gate) * up -> down_proj
-        self.experts = nn.ModuleList([
-            SwiGLU(hidden_size, intermediate_size)
-            for _ in range(num_experts)
-        ])
+        self.experts = nn.ModuleList(
+            [SwiGLU(hidden_size, intermediate_size) for _ in range(num_experts)]
+        )
 
         # 共享专家 (所有 token 都会经过)
         self.shared_expert = TrueSwiGLU(hidden_size, intermediate_size)
@@ -104,19 +104,19 @@ class Qwen3_5MoEDecoderLayer(nn.Module):
     """Qwen3.5 MoE Decoder层 (支持GatedDeltaNet线性注意力)"""
 
     def __init__(
-            self,
-            hidden_size: int,
-            num_heads: int,
-            num_kv_heads: int,
-            head_dim: int = 128,
-            num_experts: int = 8,
-            top_k: int = 2,
-            intermediate_size: int = 2048,
-            use_linear_attention: bool = True,  # Qwen3.5特色
-            dropout: float = 0.0,
-            rope_base: float = 1000000.0,
-            max_seq_len: int = 1024,
-            conv_kernel_size: int = 4,
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int = 128,
+        num_experts: int = 8,
+        top_k: int = 2,
+        intermediate_size: int = 2048,
+        use_linear_attention: bool = True,  # Qwen3.5特色
+        dropout: float = 0.0,
+        rope_base: float = 1000000.0,
+        max_seq_len: int = 1024,
+        conv_kernel_size: int = 4,
     ):
         super().__init__()
 
@@ -134,7 +134,7 @@ class Qwen3_5MoEDecoderLayer(nn.Module):
                 rope_base=rope_base,
                 max_seq_len=max_seq_len,
                 use_qk_norm=True,  # Qwen3.5特色: QK归一化
-                qk_norm_type='l2',
+                qk_norm_type="l2",
                 use_gate=True,  # 使用门控注意力
             )
         else:
@@ -184,20 +184,20 @@ class Qwen3_5MoEModel(nn.Module):
     """
 
     def __init__(
-            self,
-            vocab_size: int,
-            hidden_size: int = 768,
-            num_attention_heads: int = 12,
-            num_key_value_heads: int = 2,  # GQA
-            head_dim: int = 128,
-            num_hidden_layers: int = 2,  # 默认2层: 1层GatedDeltaNet + 1层GatedAttention
-            num_experts: int = 8,  # MoE专家总数
-            top_k: int = 2,  # 每个token激活的专家数
-            intermediate_size: int = 2048,
-            dropout: float = 0.0,
-            rope_base: float = 1000000.0,
-            max_position_embeddings: int = 1024,
-            conv_kernel_size: int = 4,
+        self,
+        vocab_size: int,
+        hidden_size: int = 768,
+        num_attention_heads: int = 12,
+        num_key_value_heads: int = 2,  # GQA
+        head_dim: int = 128,
+        num_hidden_layers: int = 2,  # 默认2层: 1层GatedDeltaNet + 1层GatedAttention
+        num_experts: int = 8,  # MoE专家总数
+        top_k: int = 2,  # 每个token激活的专家数
+        intermediate_size: int = 2048,
+        dropout: float = 0.0,
+        rope_base: float = 1000000.0,
+        max_position_embeddings: int = 1024,
+        conv_kernel_size: int = 4,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -214,7 +214,7 @@ class Qwen3_5MoEModel(nn.Module):
 
         for layer_idx in range(num_hidden_layers):
             # 第一层使用 GatedDeltaNet，其余层使用 GatedAttention
-            use_linear_attention = (layer_idx == 0)
+            use_linear_attention = layer_idx == 0
 
             self.layers.append(
                 Qwen3_5MoEDecoderLayer(
@@ -300,9 +300,9 @@ if __name__ == "__main__":
         dummy_input=dummy_input,
         onnx_path=onnx_path,
         simplify=True,
-        input_names=['input_ids'],
-        output_names=['logits'],
-        skipped_optimizers=['FuseMatMul'],
+        input_names=["input_ids"],
+        output_names=["logits"],
+        skipped_optimizers=["FuseMatMul"],
     )
 
     print(f"模型已导出到: {final_path}")
