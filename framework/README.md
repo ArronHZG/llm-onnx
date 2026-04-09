@@ -811,15 +811,6 @@ torchrun --nproc_per_node=8 fsdp_impl.py
 torchrun --nproc_per_node=8 megatron_impl.py
 ```
 
-### 通讯原语说明
-
-详见 `nccl.md` 文档，包含：
-
-- NCCL 通讯原语 (Send/Recv, Broadcast, Reduce, AllReduce, AllGather, ReduceScatter, All-to-All)
-- DeepSpeed ZeRO-1/2/3 逻辑及通讯量计算
-- PyTorch FSDP 通讯方式及通讯量
-- Megatron DP/CP/TP/EP/PP 各种并行组合及通讯量
-
 # Reference
 
 - https://docs.pytorch.org/docs/stable/distributed.html
