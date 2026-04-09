@@ -549,17 +549,17 @@ tensor_shape = (seq_length / (cp_size * tp_size), micro_batch_size, hidden_size)
 
 - 每个 micro-batch 在相邻 stage 间传递 1 次前向 activation + 1 次反向 gradient
 - P 个 stage 间共有 `P-1` 个边界，每个 micro-batch 需要跨越所有边界
-- 注意：`b` 为 micro_batch_size（单个 micro-batch 的样本数），总迭代包含 `m` 个 micro-batch
+- 注意：`b` 为 micro_batch_size（单个 micro-batch 的样本数），每个 DP rank 处理 `m` 个 micro-batch
 
 **单个 micro-batch 的通讯量**：
 
 $$\text{Comm}_{PP}^{\text{per-microbatch}} = 2(P-1) \times bsh$$
 
-**整个迭代的总通讯量**（m 个 micro-batch）：
+**每个 DP rank 的总通讯量**（m 个 micro-batch）：
 
 $$\text{Comm}_{PP} = m \times 2(P-1) \times bsh$$
 
-其中 $m = \frac{b_{\text{global}}}{D \times b}$，$b_{\text{global}}$ 为全局 batch size。
+其中 $m = \frac{b_{\text{global}}}{D \times b}$，$b_{\text{global}}$ 为全局 batch size，$D$ 为 DP size，$b$ 为单个 micro-batch size。
 
 **调度策略**:
 
@@ -595,13 +595,13 @@ $$\text{Comm}_{PP} = m \times 2(P-1) \times bsh$$
 
 **P2P 模式 (Ring Attention) 通讯量**:
 
-- Ring 拓扑中，每个 step 传递 KV Cache 的边界 chunk
-- 每个 rank 与相邻 rank 进行 `2 × (C-1)` 次 P2P 通信（前向 + 反向）
-- 每次传递的数据包含 Key 和 Value，形状为 `[s/C, b, num_kv_heads × head_dim]`
+- Ring 拓扑中，每个 rank 需要经过 `C-1` 个 step 才能获取完整的 KV Cache
+- 每个 step 传递 1 个 chunk 的 KV Cache，形状为 `[s/C, b, h_kv]`，包含 Key 和 Value 两个张量
+- 前向和反向各执行一轮完整的 Ring，因此通信次数翻倍
 
-$$\text{Comm}_{CP} = 2(C-1) \times 2 \times \frac{s}{C} \times b \times h_{kv} = 4(C-1) \times \frac{s b h_{kv}}{C}$$
+$$\text{Comm}_{CP} = \underbrace{2}_{\text{前向+反向}} \times \underbrace{(C-1)}_{\text{Ring steps}} \times \underbrace{2}_{\text{K+V}} \times \frac{s}{C} \times b \times h_{kv} = 4(C-1) \times \frac{s b h_{kv}}{C}$$
 
-其中 $h_{kv} = N_{kv} \times d_h$（$N_{kv}$ 为 KV head 数，$d_h$ 为 head 维度，通常 $h_{kv} = h$ 或使用 GQA 时 $h_{kv} < h$）。
+其中 $h_{kv} = N_{kv} \times d_h$, $N_{kv}$ 为 KV head 数，$d_h$ 为 head 维度，通常 $h_{kv} = h$ 或使用 GQA 时 $h_{kv} < h$。
 
 当 $h_{kv} = h$ 时，近似为：
 
@@ -645,13 +645,20 @@ GPU0: [t1, t2]  GPU1: [t3, t4]
 - 每次 All-to-All（dispatch + combine）：E 个 rank 间的数据交换
 - All-to-All 通讯量 = `2 × (E-1)/E × total_tokens × h`（Ring 算法等价）
 
-假设 top-k=2（每个 token 路由到 2 个 expert），被路由的 token 总数为 `2 × s × b`：
+**通讯量公式**（包含 top-k 参数）：
 
-$$\text{Comm}_{EP} = 2 \times \frac{E-1}{E} \times 2sbh = 4 \times \frac{E-1}{E} \times sbh$$
+设 $k$ 为 top-k 数值（每个 token 被路由到 k 个 expert），token 被路由的总数为 $k \times s \times b$：
 
-**注意**: 严格来说 EP 通讯量与 top-k 和 token 分布相关。当 top-k=1 且 token 均匀分布时，简化为：
+$$\text{Comm}_{EP} = 2 \times \frac{E-1}{E} \times k \times sbh = 2k \times \frac{E-1}{E} \times sbh$$
 
-$$\text{Comm}_{EP} = 2 \times \frac{E-1}{E} \times sbh$$
+其中：
+- All-to-All dispatch：$\frac{E-1}{E} \times k \times sbh$
+- All-to-All combine：$\frac{E-1}{E} \times k \times sbh$
+- 系数 2 表示前向和反向都需要通讯
+
+**特殊情况**：
+- 当 $k=1$ 时：$\text{Comm}_{EP} = 2 \times \frac{E-1}{E} \times sbh$
+- 当 $k=2$ 时：$\text{Comm}_{EP} = 4 \times \frac{E-1}{E} \times sbh$
 
 **优化**: Megatron 使用 DeepEP（`megatron/core/transformer/moe/fused_a2a.py`）融合 permute 和 all-to-all 操作，减少内存带宽开销。
 
