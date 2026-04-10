@@ -25,7 +25,7 @@ $$\text{MFU} = \frac{\text{samples/s} \times \text{FLOPs}_{\text{total}}}{\text{
 | $L_{ga}$   | GatedAttention 层数 ($L = L_{gd} + L_{ga}$) |
 | $E$        | 专家总数                                      |
 | $k$        | top-k（每 token 激活的专家数）                     |
-| $ffn\_dim$ | intermediate_size (FFN 中间维度)              |
+| $ffn\_{dim}$ | intermediate_size (FFN 中间维度)              |
 | $V$        | vocab_size                                |
 | $K$        | conv_kernel_size（ShortConvolution 卷积核大小）  |
 
@@ -127,11 +127,11 @@ MoE 结构包含一个共享专家和 k 个路由专家。
 
 **a) 共享专家 SwiGLU**（gate_proj + up_proj → SiLU(gate) × up → down_proj）：
 
-$$\text{FLOPs}_{shared} = 2bs[2h \cdot ffn\_dim + ffn\_dim \cdot h] = 6bs \cdot h \cdot ffn\_dim$$
+$$\text{FLOPs}_{shared} = 2bs[2h \cdot ffn\_{dim} + ffn\_{dim} \cdot h] = 6bs \cdot h \cdot ffn\_{dim}$$
 
 **b) 路由专家**（k 个激活的专家）：
 
-$$\text{FLOPs}_{experts} = k \times 6bs \cdot h \cdot ffn\_dim$$
+$$\text{FLOPs}_{experts} = k \times 6bs \cdot h \cdot ffn\_{dim}$$
 
 **c) Gate 路由网络**（TopKGate）：
 
@@ -139,7 +139,7 @@ $$\text{FLOPs}_{gate} = 2bs \cdot h \cdot E$$
 
 **单层 MoE FFN 总计**：
 
-$$\boxed{\text{FLOPs}_{MoE/layer} = 6(k+1)bs \cdot h \cdot ffn\_dim + 2bs \cdot h \cdot E}$$
+$$\boxed{\text{FLOPs}_{MoE/layer} = 6(k+1)bs \cdot h \cdot ffn\_{dim} + 2bs \cdot h \cdot E}$$
 
 ### 3.6 LM Head
 
@@ -159,8 +159,8 @@ $$\begin{aligned}
 
 $$\begin{aligned}
 \text{FLOPs}_{\text{total}} &= 4bshV \\
-&+ L_{gd}[12bsh^2 + 10bs n_h d^2 + 6(k+1)bsh \cdot ffn\_dim + 2bshE] \\
-&+ L_{ga}[10bsh^2 + 4bn_h s^2 d + 4bsh n_{kv} d + 6(k+1)bsh \cdot ffn\_dim + 2bshE]
+&+ L_{gd}[12bsh^2 + 10bs n_h d^2 + 6(k+1)bsh \cdot ffn\_{dim} + 2bshE] \\
+&+ L_{ga}[10bsh^2 + 4bn_h s^2 d + 4bsh n_{kv} d + 6(k+1)bsh \cdot ffn\_{dim} + 2bshE]
 \end{aligned}$$
 
 ---
@@ -173,7 +173,7 @@ $$\begin{aligned}
 | RMSNorm             | $O(bsh)$                        | $O(1)$        | 可忽略            |
 | **GagedDeltaNet**   | **$O(bsh^2 + bsn_hd^2)$**       | **$O(s)$**    | **核心优势：线性复杂度** |
 | GagedAttention      | $O(bsh^2 + bn_hs^2d)$           | $O(s^2)$      | 标准二次复杂度        |
-| MoE FFN             | $O(k \cdot bsh \cdot ffn\_dim)$ | $O(1)$        | 与激活专家数 k 成正比   |
+| MoE FFN             | $O(k \cdot bsh \cdot ffn\_{dim})$ | $O(1)$        | 与激活专家数 k 成正比   |
 
 ---
 
@@ -220,7 +220,7 @@ Qwen3.5 采用混合架构的原因：
 | $L_{ga}$ (GagedAttention 层) | 4      |
 | $E$ (专家数)                   | 64     |
 | $k$ (top-k)                 | 8      |
-| $ffn\_dim$                  | 5632   |
+| $ffn\_{dim}$                  | 5632   |
 | $V$ (vocab_size)            | 152064 |
 | $K$ (conv_kernel_size)      | 4      |
 | $b$ (batch_size)            | 1      |
@@ -330,13 +330,13 @@ $$\boxed{\text{FLOPs}_{bwd} \approx 2 \times \text{FLOPs}_{fwd}}$$
 
 **前向**：gate_proj + up_proj + SiLU × down_proj
 
-$$\text{FLOPs}_{fwd} = 6bs \cdot h \cdot ffn\_dim$$
+$$\text{FLOPs}_{fwd} = 6bs \cdot h \cdot ffn\_{dim}$$
 
 **反向**：
 - gate_proj, up_proj, down_proj 各自的反向 ≈ 2× 前向
 - SiLU 反向 ≈ 前向
 
-$$\text{FLOPs}_{bwd} \approx 14bs \cdot h \cdot ffn\_dim$$
+$$\text{FLOPs}_{bwd} \approx 14bs \cdot h \cdot ffn\_{dim}$$
 
 $$\boxed{\text{FLOPs}_{bwd} \approx 2.33 \times \text{FLOPs}_{fwd}}$$
 
@@ -404,13 +404,13 @@ $$\boxed{\begin{aligned}
 
 | 操作 | 前向 FLOPs | 反向 FLOPs | 反向/前向比 |
 |------|-----------|-----------|------------|
-| 共享专家 SwiGLU | $6bsh \cdot ffn\_dim$ | $14bsh \cdot ffn\_dim$ | ~2.33× |
-| k 个路由专家 | $6kbsh \cdot ffn\_dim$ | $14kbsh \cdot ffn\_dim$ | ~2.33× |
+| 共享专家 SwiGLU | $6bsh \cdot ffn\_{dim}$ | $14bsh \cdot ffn\_{dim}$ | ~2.33× |
+| k 个路由专家 | $6kbsh \cdot ffn\_{dim}$ | $14kbsh \cdot ffn\_{dim}$ | ~2.33× |
 | Gate 路由 | $2bshE$ | $4bshE$ | 2.0× |
 
 $$\boxed{\begin{aligned}
-\text{FLOPs}_{MoE/layer}^{fwd} &= 6(k+1)bsh \cdot ffn\_dim + 2bshE \\
-\text{FLOPs}_{MoE/layer}^{bwd} &\approx 14(k+1)bsh \cdot ffn\_dim + 4bshE \\
+\text{FLOPs}_{MoE/layer}^{fwd} &= 6(k+1)bsh \cdot ffn\_{dim} + 2bshE \\
+\text{FLOPs}_{MoE/layer}^{bwd} &\approx 14(k+1)bsh \cdot ffn\_{dim} + 4bshE \\
 \text{Ratio}_{MoE} &\approx 2.25 \times
 \end{aligned}}$$
 
@@ -425,8 +425,8 @@ $$\begin{aligned}
 
 $$\begin{aligned}
 \text{FLOPs}_{\text{train}} &= 4bshV \quad (\text{Embedding fwd+bwd}) \\
-&+ L_{gd}[38bsh^2 + 34bs n_h d^2 + 20(k+1)bsh \cdot ffn\_dim + 6bshE] \\
-&+ L_{ga}[20bsh^2 + 16bn_h s^2 d + 8bsh n_{kv}d + 20(k+1)bsh \cdot ffn\_dim + 6bshE] \\
+&+ L_{gd}[38bsh^2 + 34bs n_h d^2 + 20(k+1)bsh \cdot ffn\_{dim} + 6bshE] \\
+&+ L_{ga}[20bsh^2 + 16bn_h s^2 d + 8bsh n_{kv}d + 20(k+1)bsh \cdot ffn\_{dim} + 6bshE] \\
 &+ \underbrace{\text{FLOPs}_{\text{optimizer}}}_{\text{见下节}}
 \end{aligned}$$
 
