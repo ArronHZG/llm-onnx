@@ -23,20 +23,21 @@ llm-onnx/
 * SwiGLU, GeLU 使用 ReLU 替换
 * 固定 dims 参数
 
-| 文件                   | 模型              | 特点                                                               |
-|----------------------|-----------------|------------------------------------------------------------------|
-| `attention.py`       | 基础Attention     | 标准的Multi-Head Attention实现                                        |
-| `gpt.py`             | GPT Transformer | 多头自注意力 + 因果掩码、绝对位置嵌入、Pre-LN结构、前馈网络                               |
-| `gpt_rope.py`        | GPT + RoPE      | 旋转位置编码（Rotary Position Embedding），更好的外推能力                        |
-| `gpt_moe.py`         | GPT + MoE       | 专家混合（Mixture of Experts）、稀疏门控机制、Top-K专家路由                        |
-| `qwen3_dense.py`     | Qwen3 Dense     | RoPE、GQA(Grouped Query Attention)、SwiGLU激活                       |
-| `qwen3_moe.py`       | Qwen3 MoE       | RoPE、GQA、QK归一化、MoE(8专家+Top2路由)、SwiGLU                            |
-| `qwen3_5_dense.py`   | Qwen3.5 Dense   | Zero-Centered RMSNorm <br/> Gated Attention <br/> Gated DeltaNet |
-| `qwen3_5_moe.py`     | Qwen3.5 moe     |                                                                  |
-| `deepseekv3.py`      | DeepSeek V3     | (待实现)                                                            |
-| `deepseekv32.py`     | DeepSeek V3.2   | (待实现)                                                            |
-| `deepseek_engram.py` | DeepSeek engram | (待实现)                                                            |
-| `deepseek_mhc.py`    | DeepSeek mhc    | (待实现)                                                            |
+| 文件                       | 模型              | 特点                                                               |
+|--------------------------|-----------------|------------------------------------------------------------------|
+| `attention.py`           | 基础Attention     | 标准的Multi-Head Attention实现                                        |
+| `gpt.py`                 | GPT Transformer | 多头自注意力 + 因果掩码、绝对位置嵌入、Pre-LN结构、前馈网络                               |
+| `gpt_rope.py`            | GPT + RoPE      | 旋转位置编码（Rotary Position Embedding），更好的外推能力                        |
+| `gpt_moe.py`             | GPT + MoE       | 专家混合（Mixture of Experts）、稀疏门控机制、Top-K专家路由                        |
+| `qwen3_dense.py`         | Qwen3 Dense     | RoPE、GQA(Grouped Query Attention)、SwiGLU激活                       |
+| `qwen3_moe.py`           | Qwen3 MoE       | RoPE、GQA、QK归一化、MoE(8专家+Top2路由)、SwiGLU                            |
+| `qwen3_5_dense.py`       | Qwen3.5 Dense   | Zero-Centered RMSNorm <br/> Gated Attention <br/> Gated DeltaNet |
+| `qwen3_5_moe.py`         | Qwen3.5 moe     |                                                                  |
+| `deepseekv3.py`          | DeepSeek V3     | (待实现)                                                            |
+| `deepseekv32.py`         | DeepSeek V3.2   | (待实现)                                                            |
+| `deepseek_engram.py`     | DeepSeek engram | (待实现)                                                            |
+| `deepseek_mhc.py`        | DeepSeek mhc    | (待实现)                                                            |
+| kimi Attention Residuals |                 |                                                                  |
 
 ## 可视化结果
 
@@ -142,7 +143,7 @@ python -m visualization.positional_encoding_visualization
 
 > https://github.com/sustcsonglin/linear-attention-and-beyond-slides
 
-> 高清大图: https://github.com/CalvinXKY/InfraTech/tree/main 
+> 高清大图: https://github.com/CalvinXKY/InfraTech/tree/main
 
 ## License
 
