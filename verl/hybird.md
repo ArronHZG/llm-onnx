@@ -129,11 +129,11 @@ _ROLLOUT_REGISTRY = {
 
 ```mermaid
 sequenceDiagram
-    participant Driver as Driver (Ray Trainer)
+    participant Driver as Driver_Ray_Trainer
     participant CEM as CheckpointEngineManager
     participant Worker as ActorRolloutRefWorker
-    participant Actor as TrainingWorker.engine
-    participant Rollout as BaseRollout (vLLM)
+    participant ActorEngine as TrainingWorker.engine
+    participant RolloutEngine as BaseRollout_vLLM
 
     Driver->>CEM: update_weights(global_steps)
     
@@ -142,38 +142,37 @@ sequenceDiagram
     
     Note over Worker: === Step 0: 路由判断 ===
     alt backend != "naive"
-        Worker->>Actor: get_per_tensor_param()
-        Worker->>Worker: checkpoint_engine.send_weights()
-        Note over Worker: (跨进程模式，直接返回)
+        Worker->>ActorEngine: get_per_tensor_param
+        Worker->>Worker: checkpoint_engine.send_weights
     end
     
     Note over Worker: === Step 1: 恢复 Rollout 权重内存 ===
-    Worker->>Rollout: resume(tags=["weights"])
-    Note over Rollout: vLLM 重新分配 GPU 显存<br/>用于存放模型权重
+    Worker->>RolloutEngine: resume(tags=["weights"])
+    Note over RolloutEngine: vLLM 重新分配 GPU 显存<br/>用于存放模型权重
     
     Note over Worker: === Step 2: 导出训练权重 ===
-    Worker->>Actor: get_per_tensor_param(base_sync_done=True)
-    Note over Actor: 返回 (name, tensor) generator<br/>处理 LoRA merge/adapter
+    Worker->>ActorEngine: get_per_tensor_param(base_sync_done=True)
+    Note over ActorEngine: 返回 name+tensor generator 处理 LoRA merge/adapter
 
     Note over Worker: === Step 2.5: LoRA 首次 base 同步 ===
     opt LoRA Adapter 模式 & 首次
-        Worker->>Actor: get_per_tensor_param(base_sync_done=False)
-        Worker->>Rollout: update_weights(base_params, base_sync_done=False)
+        Worker->>ActorEngine: get_per_tensor_param(base_sync_done=False)
+        Worker->>RolloutEngine: update_weights(base_params, base_sync_done=False)
     end
 
     Note over Worker: === Step 3: 同步权重到 Rollout ===
-    Worker->>Rollout: update_weights(per_tensor_param, base_sync_done=True)
-    Note over Rollout: 逐 tensor 写入 vLLM 模型
+    Worker->>RolloutEngine: update_weights(per_tensor_param, base_sync_done=True)
+    Note over RolloutEngine: 逐 tensor 写入 vLLM 模型
 
     Note over Worker: === Step 4: Offload 训练模型到 CPU ===
     opt param_offload 启用
-        Worker->>Actor: to("cpu", model=True, optimizer=False, grad=False)
+        Worker->>ActorEngine: to("cpu", model=True, optimizer=False, grad=False)
     end
     Worker->>Worker: aggressive_empty_cache()
 
     Note over Worker: === Step 5: 恢复 KV Cache ===
-    Worker->>Rollout: resume(tags=["kv_cache"])
-    Note over Rollout: vLLM 分配 KV Cache 显存<br/>准备接收推理请求
+    Worker->>RolloutEngine: resume(tags=["kv_cache"])
+    Note over RolloutEngine: vLLM 分配 KV Cache 显存<br/>准备接收推理请求
 
     Note over Worker: === 完成：Rollout 就绪 ===
     Worker-->>CEM: 返回
@@ -368,14 +367,14 @@ await self.rollout.update_weights(
     base_sync_done=True, global_steps=global_steps
 )
 ```
-    
+
 **`sleep_level` 对 `release()` 行为的影响**：
     
 | sleep_level | `release()` 释放的内容 | GPU 保留 |
 |-------------|---------------------|---------|
 | **1** (LoRA adapter) | 仅 `kv_cache` | base 模型权重常驻 |
 | **2** (默认/merge) | `kv_cache` + `weights` | 无（完全释放） |
-    
+
 ---
 
 ## 六、两种 Backend 的权重同步路径
