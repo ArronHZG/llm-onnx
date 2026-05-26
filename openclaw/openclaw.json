@@ -1,0 +1,90 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.5.22",
+    "lastTouchedAt": "2026-05-25T10:18:49.722Z"
+  },
+  "wizard": {
+    "lastRunAt": "2026-05-25T10:18:49.673Z",
+    "lastRunVersion": "2026.5.22",
+    "lastRunCommand": "doctor",
+    "lastRunMode": "local"
+  },
+  "auth": {
+    "profiles": {
+      "sglang:default": {
+        "provider": "sglang",
+        "mode": "api_key"
+      }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "sglang": {
+        "baseUrl": "http://33.29.18.248:44400/v1",
+        "apiKey": "none",
+        "api": "openai-completions",
+        "authHeader": false,
+        "models": [
+          {
+            "id": "/home/hadoop-djst-algoplat/model/Qwen/Qwen3.5-35B-A3B",
+            "name": "/Qwen3.5-35B-A3B",
+            "reasoning": true,
+            "input": [
+              "text"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 262144,
+            "maxTokens": 8192,
+            "compat": {
+              "maxTokensField": "max_tokens"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "sglang/Qwen3.5-35B-A3B"
+      },
+      "workspace": "/Users/arron/Projects/llm-onnx",
+      "contextPruning": {
+        "mode": "cache-ttl",
+        "ttl": "1h"
+      },
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "heartbeat": {
+        "every": "30m"
+      },
+      "maxConcurrent": 4,
+      "subagents": {
+        "maxConcurrent": 8
+      }
+    }
+  },
+  "gateway": {
+    "port": 18789,
+    "mode": "local",
+    "bind": "loopback",
+    "auth": {
+      "mode": "token",
+      "token": "sglang-local-token-2025"
+    }
+  },
+  "plugins": {
+    "entries": {
+      "sglang": {
+        "enabled": true
+      }
+    }
+  }
+}
